@@ -1,0 +1,186 @@
+import time
+from collections import defaultdict
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from typing import Any
+
+from hfwb.aave import AccountData, normalize_address, read_market
+from hfwb.format import (
+    format_delete,
+    format_help,
+    format_invalid_address,
+    format_list,
+    format_market_name,
+    format_positions_limit,
+    format_privacy,
+    format_rate_limit,
+    format_remove,
+    format_rescan_rate_limit,
+    format_scan_response,
+    format_start,
+    format_unknown,
+    format_watch_limit,
+)
+from hfwb.markets import Market, get_market, load_markets
+from hfwb.scan import ScanResult, scan_address
+from hfwb.state import step
+from hfwb.store import (
+    LimitError,
+    add_tracked_address,
+    add_watch,
+    delete_chat,
+    list_tracked_addresses,
+    list_watches,
+    remove_address,
+    update_last_scan_ts,
+)
+
+RATE_LIMIT_COMMANDS = 10
+RATE_LIMIT_WINDOW = 60.0  # seconds
+RESCAN_RATE_LIMIT_WINDOW = 300.0  # 5 minutes in seconds
+
+
+class BotHandler:
+    """Processes incoming Telegram updates and executes bot commands."""
+
+    def __init__(
+        self,
+        db_path: str | Path,
+        rpc_urls: Sequence[str] = (),
+        markets: Sequence[Market] | None = None,
+        clock: Callable[[], float] = time.time,
+        aave_reader: Callable[..., AccountData] = read_market,
+        scanner_fn: Callable[..., ScanResult] = scan_address,
+    ) -> None:
+        self.db_path = Path(db_path)
+        self.rpc_urls = rpc_urls
+        self.markets = list(markets) if markets is not None else load_markets()
+        self.clock = clock
+        self.aave_reader = aave_reader
+        self.scanner_fn = scanner_fn
+        self._history: dict[int, list[float]] = defaultdict(list)
+        self._rescan_history: dict[int, float] = {}
+
+    def _is_rate_limited(self, chat_id: int) -> bool:
+        now = self.clock()
+        window_start = now - RATE_LIMIT_WINDOW
+        timestamps = [ts for ts in self._history[chat_id] if ts > window_start]
+        self._history[chat_id] = timestamps
+
+        if len(timestamps) >= RATE_LIMIT_COMMANDS:
+            return True
+
+        self._history[chat_id].append(now)
+        return False
+
+    def handle(self, update: dict[str, Any]) -> list[tuple[int, str]]:
+        """Handle a single Telegram update dict and return list of (chat_id, text) replies."""
+        message = update.get("message") or update.get("edited_message")
+        if not isinstance(message, dict):
+            return []
+
+        chat = message.get("chat")
+        if not isinstance(chat, dict) or "id" not in chat:
+            return []
+        chat_id = chat["id"]
+
+        text = message.get("text", "")
+        if not isinstance(text, str):
+            return []
+        text = text.strip()
+        if not text:
+            return []
+
+        if self._is_rate_limited(chat_id):
+            return [(chat_id, format_rate_limit())]
+
+        tokens = text.split()
+        cmd = tokens[0].split("@")[0].lower()
+
+        if cmd == "/start":
+            return [(chat_id, format_start())]
+        if cmd == "/help":
+            return [(chat_id, format_help())]
+        if cmd == "/privacy":
+            return [(chat_id, format_privacy())]
+        if cmd == "/delete":
+            count = delete_chat(self.db_path, chat_id)
+            return [(chat_id, format_delete(count))]
+
+        if cmd == "/list":
+            tracked = list_tracked_addresses(self.db_path, chat_id)
+            watches = list_watches(self.db_path, chat_id)
+            if not tracked and not watches:
+                return [(chat_id, format_list([]))]
+
+            watches_by_addr: dict[str, list[tuple[str, str]]] = defaultdict(list)
+            for w in watches:
+                m = get_market(w.market_key)
+                m_name = format_market_name(m) if m else w.market_key
+                watches_by_addr[w.address].append((m_name, w.state))
+
+            grouped: list[tuple[str, list[tuple[str, str]]]] = []
+            seen_addrs: set[str] = set()
+            for t in tracked:
+                grouped.append((t.address, watches_by_addr.get(t.address, [])))
+                seen_addrs.add(t.address)
+
+            for addr, w_list in watches_by_addr.items():
+                if addr not in seen_addrs:
+                    grouped.append((addr, w_list))
+
+            return [(chat_id, format_list(grouped))]
+
+        if cmd == "/remove":
+            if len(tokens) < 2:
+                return [(chat_id, "Usage: /remove &lt;address&gt;")]
+            try:
+                norm_addr = normalize_address(tokens[1])
+            except ValueError as exc:
+                return [(chat_id, format_invalid_address(str(exc)))]
+            removed = remove_address(self.db_path, chat_id, norm_addr)
+            return [(chat_id, format_remove(norm_addr, removed))]
+
+        if cmd in ("/watch", "/rescan"):
+            is_rescan = cmd == "/rescan"
+            if len(tokens) < 2:
+                return [(chat_id, f"Usage: {cmd} &lt;address&gt;")]
+            try:
+                norm_addr = normalize_address(tokens[1])
+            except ValueError as exc:
+                return [(chat_id, format_invalid_address(str(exc)))]
+
+            now = self.clock()
+
+            if is_rescan:
+                last_rescan = self._rescan_history.get(chat_id)
+                if last_rescan is not None and (now - last_rescan) < RESCAN_RATE_LIMIT_WINDOW:
+                    return [(chat_id, format_rescan_rate_limit())]
+                self._rescan_history[chat_id] = now
+
+            try:
+                add_tracked_address(self.db_path, chat_id, norm_addr)
+            except LimitError:
+                return [(chat_id, format_watch_limit())]
+
+            scan_res = self.scanner_fn(norm_addr, self.markets, reader=self.aave_reader)
+
+            limit_hit = False
+            for market, acct in scan_res.found:
+                initial_state, _ = step("ok", acct.hf, now_ts=now, last_alert_ts=None)
+                try:
+                    add_watch(self.db_path, chat_id, norm_addr, market.key, state=initial_state)
+                except LimitError:
+                    limit_hit = True
+                    break
+
+            # a scan with unchecked markets stays due, so the next rescan retries it
+            if not scan_res.failed:
+                update_last_scan_ts(self.db_path, chat_id, norm_addr, now)
+
+            text = format_scan_response(norm_addr, scan_res.found, len(scan_res.failed), is_rescan=is_rescan)
+            if limit_hit:
+                text += "\n\n" + format_positions_limit()
+            return [(chat_id, text)]
+
+        return [(chat_id, format_unknown())]

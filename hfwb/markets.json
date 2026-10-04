@@ -1,0 +1,468 @@
+{
+ "generated": "2026-10-04",
+ "source": "bgd-labs/aave-address-book + live eth_call probe",
+ "markets": [
+  {
+   "protocol": "aave_v3",
+   "chain": "Ethereum",
+   "chain_id": 1,
+   "name": "Main market",
+   "address": "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2",
+   "rpcs": [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "Arbitrum",
+   "chain_id": 42161,
+   "name": "Main market",
+   "address": "0x794a61358D6845594F94dc1DB02A252b5b4814aD",
+   "rpcs": [
+    "https://arbitrum-one-rpc.publicnode.com",
+    "https://arb1.arbitrum.io/rpc"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "Optimism",
+   "chain_id": 10,
+   "name": "Main market",
+   "address": "0x794a61358D6845594F94dc1DB02A252b5b4814aD",
+   "rpcs": [
+    "https://optimism-rpc.publicnode.com",
+    "https://mainnet.optimism.io"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "Base",
+   "chain_id": 8453,
+   "name": "Main market",
+   "address": "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
+   "rpcs": [
+    "https://base-rpc.publicnode.com",
+    "https://mainnet.base.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "Polygon",
+   "chain_id": 137,
+   "name": "Main market",
+   "address": "0x794a61358D6845594F94dc1DB02A252b5b4814aD",
+   "rpcs": [
+    "https://polygon.drpc.org",
+    "https://1rpc.io/matic"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "Avalanche",
+   "chain_id": 43114,
+   "name": "Main market",
+   "address": "0x794a61358D6845594F94dc1DB02A252b5b4814aD",
+   "rpcs": [
+    "https://avalanche-c-chain-rpc.publicnode.com",
+    "https://api.avax.network/ext/bc/C/rpc"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "BNB",
+   "chain_id": 56,
+   "name": "Main market",
+   "address": "0x6807dc923806fE8Fd134338EABCA509979a7e0cB",
+   "rpcs": [
+    "https://bsc-rpc.publicnode.com",
+    "https://bsc-dataseed.bnbchain.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "Gnosis",
+   "chain_id": 100,
+   "name": "Main market",
+   "address": "0xb50201558B00496A145fE76f7424749556E326D8",
+   "rpcs": [
+    "https://gnosis-rpc.publicnode.com",
+    "https://rpc.gnosischain.com"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "Scroll",
+   "chain_id": 534352,
+   "name": "Main market",
+   "address": "0x11fCfe756c05AD438e312a7fd934381537D3cFfe",
+   "rpcs": [
+    "https://scroll-rpc.publicnode.com",
+    "https://rpc.scroll.io"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "Linea",
+   "chain_id": 59144,
+   "name": "Main market",
+   "address": "0xc47b8C00b0f69a36fa203Ffeac0334874574a8Ac",
+   "rpcs": [
+    "https://linea-rpc.publicnode.com",
+    "https://rpc.linea.build"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "Metis",
+   "chain_id": 1088,
+   "name": "Main market",
+   "address": "0x90df02551bB792286e8D4f13E0e357b4Bf1D6a57",
+   "rpcs": [
+    "https://metis-rpc.publicnode.com",
+    "https://andromeda.metis.io"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "Celo",
+   "chain_id": 42220,
+   "name": "Main market",
+   "address": "0x3E59A31363E2ad014dcbc521c4a0d5757d9f3402",
+   "rpcs": [
+    "https://forno.celo.org",
+    "https://celo-rpc.publicnode.com"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "Sonic",
+   "chain_id": 146,
+   "name": "Main market",
+   "address": "0x5362dBb1e601abF3a4c14c22ffEdA64042E5eAA3",
+   "rpcs": [
+    "https://sonic-rpc.publicnode.com"
+   ],
+   "best_effort": true
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "Mantle",
+   "chain_id": 5000,
+   "name": "Main market",
+   "address": "0x458F293454fE0d67EC0655f3672301301DD51422",
+   "rpcs": [
+    "https://rpc.mantle.xyz",
+    "https://mantle-rpc.publicnode.com"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "Soneium",
+   "chain_id": 1868,
+   "name": "Main market",
+   "address": "0xDd3d7A7d03D9fD9ef45f3E587287922eF65CA38B",
+   "rpcs": [
+    "https://rpc.soneium.org"
+   ],
+   "best_effort": true
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "ZkSync",
+   "chain_id": 324,
+   "name": "Main market",
+   "address": "0x78e30497a3c7527d953c6B1E3541b021A98Ac43c",
+   "rpcs": [
+    "https://mainnet.era.zksync.io"
+   ],
+   "best_effort": true
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "Plasma",
+   "chain_id": 9745,
+   "name": "Main market",
+   "address": "0x925a2A7214Ed92428B5b1B090F80b25700095e12",
+   "rpcs": [
+    "https://rpc.plasma.to"
+   ],
+   "best_effort": true
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "XLayer",
+   "chain_id": 196,
+   "name": "Main market",
+   "address": "0xE3F3Caefdd7180F884c01E57f65Df979Af84f116",
+   "rpcs": [
+    "https://rpc.xlayer.tech",
+    "https://xlayerrpc.okx.com"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "MegaEth",
+   "chain_id": 4326,
+   "name": "Main market",
+   "address": "0x7e324AbC5De01d112AfC03a584966ff199741C28",
+   "rpcs": [
+    "https://mainnet.megaeth.com/rpc"
+   ],
+   "best_effort": true
+  },
+  {
+   "protocol": "aave_v3",
+   "chain": "Monad",
+   "chain_id": 143,
+   "name": "Main market",
+   "address": "0x69a5F9AD4f96ebf0a0C792dD42a01cC5C0102fef",
+   "rpcs": [
+    "https://rpc.monad.xyz"
+   ],
+   "best_effort": true
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Ethereum",
+   "chain_id": 1,
+   "name": "Bluechip Spoke",
+   "address": "0x973a023A77420ba610f06b3858aD991Df6d85A08",
+   "rpcs": [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Ethereum",
+   "chain_id": 1,
+   "name": "Ethena Correlated Spoke",
+   "address": "0x58131E79531caB1d52301228d1f7b842F26B9649",
+   "rpcs": [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Ethereum",
+   "chain_id": 1,
+   "name": "Ethena Ecosystem Spoke",
+   "address": "0xba1B3D55D249692b669A164024A838309B7508AF",
+   "rpcs": [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Ethereum",
+   "chain_id": 1,
+   "name": "Forex Spoke",
+   "address": "0xD8B93635b8C6d0fF98CbE90b5988E3F2d1Cd9da1",
+   "rpcs": [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Ethereum",
+   "chain_id": 1,
+   "name": "Gold Spoke",
+   "address": "0x65407b940966954b23dfA3caA5C0702bB42984DC",
+   "rpcs": [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Ethereum",
+   "chain_id": 1,
+   "name": "Lombard BTC Spoke",
+   "address": "0x7EC68b5695e803e98a21a9A05d744F28b0a7753D",
+   "rpcs": [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Ethereum",
+   "chain_id": 1,
+   "name": "Main Spoke",
+   "address": "0x94e7A5dCbE816e498b89aB752661904E2F56c485",
+   "rpcs": [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Ethereum",
+   "chain_id": 1,
+   "name": "PAXG Gold Spoke",
+   "address": "0xAD75cE6354f87F3135cE10621d385d8D1e2562C2",
+   "rpcs": [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Ethereum",
+   "chain_id": 1,
+   "name": "USDG Pendle Spoke",
+   "address": "0x956d8e0A89cfa3744428C4641b5a53B56167a7f9",
+   "rpcs": [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Ethereum",
+   "chain_id": 1,
+   "name": "EtherFi eSpoke",
+   "address": "0xbF10BDfE177dE0336aFD7fcCF80A904E15386219",
+   "rpcs": [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Ethereum",
+   "chain_id": 1,
+   "name": "Kelp eSpoke",
+   "address": "0x3131FE68C4722e726fe6B2819ED68e514395B9a4",
+   "rpcs": [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Ethereum",
+   "chain_id": 1,
+   "name": "Lido eSpoke",
+   "address": "0xe1900480ac69f0B296841Cd01cC37546d92F35Cd",
+   "rpcs": [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Ethereum",
+   "chain_id": 1,
+   "name": "USDG Maple eSpoke",
+   "address": "0x774b9655413c34809c1f1b16b654465A89EBE989",
+   "rpcs": [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Arc",
+   "chain_id": 5042,
+   "name": "Main Spoke",
+   "address": "0xB843bdC3a87A05E77E07Df9FE48928b3A34b134d",
+   "rpcs": [
+    "https://arc-rpc.publicnode.com",
+    "https://arc.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Arc",
+   "chain_id": 5042,
+   "name": "Forex Spoke",
+   "address": "0x4164EBCAF74670aa74C8D4F59de6157c0780F1bB",
+   "rpcs": [
+    "https://arc-rpc.publicnode.com",
+    "https://arc.drpc.org"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Avalanche",
+   "chain_id": 43114,
+   "name": "Main Spoke",
+   "address": "0x435272CefF93a1E657E8ABfdf0A13e95900A3a56",
+   "rpcs": [
+    "https://avalanche-c-chain-rpc.publicnode.com",
+    "https://api.avax.network/ext/bc/C/rpc"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Avalanche",
+   "chain_id": 43114,
+   "name": "Forex Spoke",
+   "address": "0x6a37776B5E026dBdF043b4F933c323C84DD1B514",
+   "rpcs": [
+    "https://avalanche-c-chain-rpc.publicnode.com",
+    "https://api.avax.network/ext/bc/C/rpc"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Avalanche",
+   "chain_id": 43114,
+   "name": "AVAX Correlated Spoke",
+   "address": "0x3b517594277c67307CF2d7CBE6FE1D4399B68c41",
+   "rpcs": [
+    "https://avalanche-c-chain-rpc.publicnode.com",
+    "https://api.avax.network/ext/bc/C/rpc"
+   ],
+   "best_effort": false
+  },
+  {
+   "protocol": "aave_v4",
+   "chain": "Base",
+   "chain_id": 8453,
+   "name": "Mag7 Spoke",
+   "address": "0x17905Db0e4A3514467539956c084180616AE7B8D",
+   "rpcs": [
+    "https://base-rpc.publicnode.com",
+    "https://mainnet.base.org"
+   ],
+   "best_effort": false
+  }
+ ]
+}

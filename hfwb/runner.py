@@ -1,0 +1,389 @@
+import logging
+import signal
+import threading
+import time
+import urllib.parse
+from collections import defaultdict
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any
+
+from hfwb.aave import AccountData, ReadError, read_market
+from hfwb.bot import BotHandler
+from hfwb.format import format_alert, format_new_position
+from hfwb.markets import Market, get_market, load_markets
+from hfwb.scan import scan_address
+from hfwb.state import step
+from hfwb.store import (
+    LimitError,
+    add_watch,
+    clear_failure,
+    delete_chat,
+    distinct_pairs,
+    get_due_rescans,
+    list_watches,
+    list_watches_by_address,
+    record_failure,
+    update_last_scan_ts,
+    update_state,
+)
+from hfwb.telegram import Blocked, TelegramClient, TelegramError
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_CONCURRENCY_CAP = 5
+DEFAULT_PER_HOST_CAP = 3
+DEFAULT_POLL_INTERVAL = 300.0  # seconds
+DEFAULT_RESCAN_INTERVAL = 86400.0  # 24 hours
+
+
+def _extract_host(market: Market | None) -> str:
+    if market is None or not market.rpcs:
+        return "unknown"
+    parsed = urllib.parse.urlparse(market.rpcs[0])
+    return parsed.netloc or parsed.path or "unknown"
+
+
+def poll_once(
+    db_path: str | Path,
+    markets: Sequence[Market] | None = None,
+    rpc_urls: Sequence[str] | None = None,
+    tg_client: Any = None,
+    reader_fn: Callable[..., AccountData] = read_market,
+    clock: Callable[[], float] = time.time,
+    heartbeat_file: str | Path | None = None,
+    concurrency_cap: int = DEFAULT_CONCURRENCY_CAP,
+    per_host_cap: int = DEFAULT_PER_HOST_CAP,
+) -> None:
+    """Execute a single polling cycle across all distinct (market, address) pairs."""
+    pairs = distinct_pairs(db_path)
+    all_markets = list(markets) if markets is not None else load_markets()
+    market_map = {m.key: m for m in all_markets}
+
+    host_semaphores: dict[str, threading.Semaphore] = defaultdict(
+        lambda: threading.Semaphore(per_host_cap)
+    )
+
+    def _read_pair(m_key: str, addr: str) -> tuple[str, str, AccountData | Exception]:
+        m = market_map.get(m_key) or get_market(m_key)
+        host = _extract_host(m)
+        with host_semaphores[host]:
+            try:
+                if m is not None:
+                    data = reader_fn(m, addr)
+                else:
+                    raise ReadError(f"Unknown market key: {m_key}")
+                return (m_key, addr, data)
+            except Exception as exc:  # noqa: BLE001 - one bad pair must not abort cycle
+                return (m_key, addr, exc)
+
+    results: dict[tuple[str, str], AccountData | Exception] = {}
+    if pairs:
+        max_workers = min(concurrency_cap, len(pairs)) or 1
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_pair = {
+                executor.submit(_read_pair, m_key, addr): (m_key, addr)
+                for m_key, addr in pairs
+            }
+            for future in as_completed(future_to_pair):
+                m_key, addr, outcome = future.result()
+                results[(m_key, addr)] = outcome
+
+    now = clock()
+
+    for (m_key, addr), outcome in results.items():
+        market = market_map.get(m_key) or get_market(m_key)
+
+        if isinstance(outcome, Exception):
+            if isinstance(outcome, ReadError):
+                fail_count = record_failure(db_path, m_key, addr)
+                if fail_count >= 3:
+                    logger.error(
+                        "Market %s address %s failed %d consecutive RPC reads: %s",
+                        m_key,
+                        addr,
+                        fail_count,
+                        outcome,
+                    )
+            else:
+                logger.error(
+                    "Unexpected error reading market %s address %s: %s",
+                    m_key,
+                    addr,
+                    outcome,
+                )
+            # On error, keep previous state, send nothing to users
+            continue
+
+        # Successful read
+        clear_failure(db_path, m_key, addr)
+        watches = list_watches_by_address(db_path, addr, market_key=m_key)
+        for watch in watches:
+            new_state, alert = step(
+                prev_state=watch.state,
+                hf=outcome.hf,
+                now_ts=now,
+                last_alert_ts=watch.last_alert_ts,
+            )
+
+            if alert is not None:
+                alert_text = format_alert(
+                    alert_type=alert,
+                    address=addr,
+                    hf=outcome.hf,
+                    collateral_usd=outcome.collateral_usd,
+                    debt_usd=outcome.debt_usd,
+                    market=market,
+                )
+                try:
+                    tg_client.send_message(watch.chat_id, alert_text)
+                    update_state(
+                        db_path,
+                        watch.chat_id,
+                        addr,
+                        m_key,
+                        new_state,
+                        last_alert_ts=now,
+                    )
+                except Blocked:
+                    logger.info("Bot blocked by user %s; deleting all chat data", watch.chat_id)
+                    delete_chat(db_path, watch.chat_id)
+                except TelegramError as exc:
+                    # Keep previous state so next poll retries this alert
+                    logger.warning("Failed to send alert to %s: %s", watch.chat_id, exc)
+            elif new_state != watch.state:
+                update_state(db_path, watch.chat_id, addr, m_key, new_state)
+
+    if heartbeat_file is not None:
+        hb_path = Path(heartbeat_file)
+        hb_path.parent.mkdir(parents=True, exist_ok=True)
+        hb_path.write_text(f"{int(now)}\n", encoding="utf-8")
+
+
+def rescan_due_addresses(
+    db_path: str | Path,
+    tg_client: Any,
+    markets: Sequence[Market] | None = None,
+    scanner_fn: Callable[..., Any] = scan_address,
+    reader_fn: Callable[..., AccountData] = read_market,
+    clock: Callable[[], float] = time.time,
+    interval_seconds: float = DEFAULT_RESCAN_INTERVAL,
+) -> None:
+    """Scan tracked addresses that are due for daily rescan (older than 24h)."""
+    now = clock()
+    due_records = get_due_rescans(db_path, now, interval_seconds=interval_seconds)
+    if not due_records:
+        return
+
+    all_markets = list(markets) if markets is not None else load_markets()
+
+    # Group due records by address
+    addrs_to_chats: dict[str, list[int]] = defaultdict(list)
+    for rec in due_records:
+        addrs_to_chats[rec.address].append(rec.chat_id)
+
+    for addr, chat_ids in addrs_to_chats.items():
+        try:
+            scan_res = scanner_fn(addr, all_markets, reader=reader_fn)
+            for chat_id in chat_ids:
+                existing_watches = list_watches(db_path, chat_id, address=addr)
+                watched_keys = {w.market_key for w in existing_watches}
+
+                for market, acct in scan_res.found:
+                    if market.key not in watched_keys:
+                        initial_state, _ = step("ok", acct.hf, now_ts=now, last_alert_ts=None)
+                        try:
+                            add_watch(db_path, chat_id, addr, market.key, state=initial_state)
+                        except LimitError:
+                            logger.warning("Chat %s is at its position limit; skipping %s", chat_id, market.key)
+                            continue
+                        msg = format_new_position(
+                            addr,
+                            market,
+                            acct.hf,
+                            collateral_usd=acct.collateral_usd,
+                            debt_usd=acct.debt_usd,
+                        )
+                        try:
+                            tg_client.send_message(chat_id, msg)
+                        except Blocked:
+                            logger.info("Bot blocked by user %s during rescan; deleting chat", chat_id)
+                            delete_chat(db_path, chat_id)
+                        except TelegramError as exc:
+                            logger.warning("Failed to send new position alert to %s: %s", chat_id, exc)
+
+                # a scan with unchecked markets stays due, so the next rescan retries it
+                if not scan_res.failed:
+                    update_last_scan_ts(db_path, chat_id, addr, now)
+        except Exception:
+            logger.exception("Error during rescan for address %s", addr)
+
+
+def run_poll_loop(
+    stop_event: threading.Event,
+    db_path: str | Path,
+    markets: Sequence[Market] | None = None,
+    rpc_urls: Sequence[str] | None = None,
+    tg_client: Any = None,
+    heartbeat_file: str | Path | None = None,
+    poll_interval: float = DEFAULT_POLL_INTERVAL,
+    clock: Callable[[], float] = time.time,
+    reader_fn: Callable[..., AccountData] = read_market,
+    concurrency_cap: int = DEFAULT_CONCURRENCY_CAP,
+    per_host_cap: int = DEFAULT_PER_HOST_CAP,
+) -> None:
+    """Run recurring poll loop in background until stop_event is set."""
+    logger.info("Starting poll loop (interval=%.1fs)", poll_interval)
+    while not stop_event.is_set():
+        try:
+            poll_once(
+                db_path=db_path,
+                markets=markets,
+                rpc_urls=rpc_urls,
+                tg_client=tg_client,
+                reader_fn=reader_fn,
+                clock=clock,
+                heartbeat_file=heartbeat_file,
+                concurrency_cap=concurrency_cap,
+                per_host_cap=per_host_cap,
+            )
+        except Exception:  # top-level guard: a bug must not silently stop alerting
+            logger.exception("Unhandled error in poll_once")
+
+        stop_event.wait(poll_interval)
+    logger.info("Poll loop stopped")
+
+
+def run_rescan_loop(
+    stop_event: threading.Event,
+    db_path: str | Path,
+    tg_client: Any,
+    markets: Sequence[Market] | None = None,
+    check_interval: float = 300.0,
+    scanner_fn: Callable[..., Any] = scan_address,
+    reader_fn: Callable[..., AccountData] = read_market,
+    clock: Callable[[], float] = time.time,
+    rescan_interval: float = DEFAULT_RESCAN_INTERVAL,
+) -> None:
+    """Run recurring daily rescan worker in background until stop_event is set."""
+    logger.info("Starting rescan loop (check_interval=%.1fs)", check_interval)
+    while not stop_event.is_set():
+        try:
+            rescan_due_addresses(
+                db_path=db_path,
+                tg_client=tg_client,
+                markets=markets,
+                scanner_fn=scanner_fn,
+                reader_fn=reader_fn,
+                clock=clock,
+                interval_seconds=rescan_interval,
+            )
+        except Exception:
+            logger.exception("Unhandled error in rescan_due_addresses")
+
+        stop_event.wait(check_interval)
+    logger.info("Rescan loop stopped")
+
+
+def run_command_loop(
+    stop_event: threading.Event,
+    bot_handler: BotHandler,
+    tg_client: TelegramClient,
+    poll_timeout: int = 50,
+) -> None:
+    """Run long-polling command loop until stop_event is set."""
+    logger.info("Starting command loop (timeout=%ds)", poll_timeout)
+    offset: int | None = None
+    while not stop_event.is_set():
+        try:
+            updates = tg_client.get_updates(offset=offset, timeout=poll_timeout)
+            for update in updates:
+                update_id = update.get("update_id")
+                if update_id is not None:
+                    offset = update_id + 1
+
+                replies = bot_handler.handle(update)
+                for chat_id, text in replies:
+                    try:
+                        tg_client.send_message(chat_id, text)
+                    except Blocked:
+                        logger.info("Bot blocked by user %s; deleting chat", chat_id)
+                        delete_chat(bot_handler.db_path, chat_id)
+                    except TelegramError as exc:
+                        logger.warning("Failed to send reply to %s: %s", chat_id, exc)
+        except TelegramError as exc:
+            if stop_event.is_set():
+                break
+            logger.error("Telegram error in command loop: %s", exc)
+            stop_event.wait(5.0)
+        except Exception:  # top-level guard: keep serving commands after a bug
+            if stop_event.is_set():
+                break
+            logger.exception("Unexpected error in command loop")
+            stop_event.wait(5.0)
+    logger.info("Command loop stopped")
+
+
+def run_all(
+    db_path: str | Path,
+    tg_client: TelegramClient,
+    markets: Sequence[Market] | None = None,
+    rpc_urls: Sequence[str] | None = None,
+    heartbeat_file: str | Path | None = None,
+    poll_interval: float = DEFAULT_POLL_INTERVAL,
+    poll_timeout: int = 50,
+) -> None:
+    """Run poll loop, daily rescan loop, and command loop with graceful shutdown."""
+    stop_event = threading.Event()
+
+    def _sig_handler(signum: int, frame: Any) -> None:
+        sig_name = signal.Signals(signum).name
+        logger.info("Received %s, initiating graceful shutdown...", sig_name)
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _sig_handler)
+    signal.signal(signal.SIGINT, _sig_handler)
+
+    all_markets = list(markets) if markets is not None else load_markets()
+    bot_handler = BotHandler(db_path=db_path, markets=all_markets, rpc_urls=rpc_urls or ())
+
+    poll_thread = threading.Thread(
+        target=run_poll_loop,
+        kwargs={
+            "stop_event": stop_event,
+            "db_path": db_path,
+            "markets": all_markets,
+            "rpc_urls": rpc_urls,
+            "tg_client": tg_client,
+            "heartbeat_file": heartbeat_file,
+            "poll_interval": poll_interval,
+        },
+        daemon=True,
+    )
+    poll_thread.start()
+
+    rescan_thread = threading.Thread(
+        target=run_rescan_loop,
+        kwargs={
+            "stop_event": stop_event,
+            "db_path": db_path,
+            "tg_client": tg_client,
+            "markets": all_markets,
+        },
+        daemon=True,
+    )
+    rescan_thread.start()
+
+    try:
+        run_command_loop(
+            stop_event=stop_event,
+            bot_handler=bot_handler,
+            tg_client=tg_client,
+            poll_timeout=poll_timeout,
+        )
+    finally:
+        stop_event.set()
+        poll_thread.join(timeout=10.0)
+        rescan_thread.join(timeout=5.0)
+        logger.info("Shutdown complete")

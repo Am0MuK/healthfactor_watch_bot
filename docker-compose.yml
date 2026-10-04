@@ -1,0 +1,13 @@
+services:
+  healthfactor_watch_bot:
+    build: .
+    restart: unless-stopped
+    user: "1001:1001"   # owner of /data/services/healthfactor_watch_bot (mode 700)
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    env_file:
+      - /data/services/healthfactor_watch_bot/.env
+    volumes:
+      - /data/services/healthfactor_watch_bot:/data/services/healthfactor_watch_bot
