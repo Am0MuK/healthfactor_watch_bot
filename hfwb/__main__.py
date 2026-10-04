@@ -94,7 +94,6 @@ def main(argv: list[str] | None = None) -> int:
         markets=all_markets,
         rpc_urls=config.rpc_urls,
         heartbeat_file=config.heartbeat_file,
-        poll_interval=config.poll_interval,
     )
     return 0
 

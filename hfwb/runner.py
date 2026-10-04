@@ -15,6 +15,7 @@ from hfwb.bot import BotHandler
 from hfwb.format import format_alert, format_new_position
 from hfwb.markets import Market, get_market, load_markets
 from hfwb.scan import scan_address
+from hfwb.schedule import INTERVAL_FAR, backoff_for, combine, poll_interval_for
 from hfwb.state import step
 from hfwb.store import (
     LimitError,
@@ -36,8 +37,48 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONCURRENCY_CAP = 5
 DEFAULT_PER_HOST_CAP = 3
-DEFAULT_POLL_INTERVAL = 300.0  # seconds
+DEFAULT_POLL_INTERVAL = 300.0  # seconds (deprecated, kept for backwards compatibility)
+DEFAULT_TICK_SECONDS = 15.0  # seconds
 DEFAULT_RESCAN_INTERVAL = 86400.0  # 24 hours
+
+
+class PollScheduler:
+    """In-memory scheduler tracking next due timestamps and failure streaks per pair."""
+
+    def __init__(self) -> None:
+        self.next_due: dict[tuple[str, str], float] = {}
+        self.fail_streak: dict[tuple[str, str], int] = {}
+
+    def is_due(self, pair: tuple[str, str], now: float) -> bool:
+        """A pair that is not known yet is due immediately; at startup everything is due."""
+        if pair not in self.next_due:
+            return True
+        return now >= self.next_due[pair]
+
+    def record_success(self, pair: tuple[str, str], next_poll_ts: float) -> None:
+        """Reset fail streak and schedule next poll timestamp."""
+        self.fail_streak.pop(pair, None)
+        self.next_due[pair] = next_poll_ts
+
+    def record_failure(self, pair: tuple[str, str], now: float) -> int:
+        """Increment fail streak and calculate next due timestamp using backoff. Returns new streak."""
+        streak = self.fail_streak.get(pair, 0) + 1
+        self.fail_streak[pair] = streak
+        self.next_due[pair] = now + backoff_for(streak)
+        return streak
+
+    def get_fail_streak(self, pair: tuple[str, str]) -> int:
+        """Return the current consecutive failure streak for a pair."""
+        return self.fail_streak.get(pair, 0)
+
+    def prune(self, active_pairs: set[tuple[str, str]]) -> None:
+        """Forget pairs that have disappeared from distinct_pairs()."""
+        for p in list(self.next_due.keys()):
+            if p not in active_pairs:
+                del self.next_due[p]
+        for p in list(self.fail_streak.keys()):
+            if p not in active_pairs:
+                del self.fail_streak[p]
 
 
 def _extract_host(market: Market | None) -> str:
@@ -47,8 +88,10 @@ def _extract_host(market: Market | None) -> str:
     return parsed.netloc or parsed.path or "unknown"
 
 
-def poll_once(
+def _poll_core(
     db_path: str | Path,
+    scheduler: PollScheduler | None = None,
+    poll_all: bool = False,
     markets: Sequence[Market] | None = None,
     rpc_urls: Sequence[str] | None = None,
     tg_client: Any = None,
@@ -58,8 +101,18 @@ def poll_once(
     concurrency_cap: int = DEFAULT_CONCURRENCY_CAP,
     per_host_cap: int = DEFAULT_PER_HOST_CAP,
 ) -> None:
-    """Execute a single polling cycle across all distinct (market, address) pairs."""
+    now = clock()
     pairs = distinct_pairs(db_path)
+    active_pairs_set = set(pairs)
+
+    if scheduler is not None:
+        scheduler.prune(active_pairs_set)
+
+    if poll_all or scheduler is None:
+        pairs_to_read = pairs
+    else:
+        pairs_to_read = [p for p in pairs if scheduler.is_due(p, now)]
+
     all_markets = list(markets) if markets is not None else load_markets()
     market_map = {m.key: m for m in all_markets}
 
@@ -81,18 +134,17 @@ def poll_once(
                 return (m_key, addr, exc)
 
     results: dict[tuple[str, str], AccountData | Exception] = {}
-    if pairs:
-        max_workers = min(concurrency_cap, len(pairs)) or 1
+    if pairs_to_read:
+        max_workers = min(concurrency_cap, len(pairs_to_read)) or 1
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_pair = {
                 executor.submit(_read_pair, m_key, addr): (m_key, addr)
-                for m_key, addr in pairs
+                for m_key, addr in pairs_to_read
             }
             for future in as_completed(future_to_pair):
                 m_key, addr, outcome = future.result()
                 results[(m_key, addr)] = outcome
 
-    now = clock()
     chat_levels_cache: dict[int, tuple[Decimal, ...]] = {}
 
     def _get_chat_levels(chat_id: int) -> tuple[Decimal, ...]:
@@ -100,8 +152,9 @@ def poll_once(
             chat_levels_cache[chat_id] = get_levels(db_path, chat_id)
         return chat_levels_cache[chat_id]
 
-    for (m_key, addr), outcome in results.items():
+    def _handle_result(m_key: str, addr: str, outcome: AccountData | Exception) -> None:
         market = market_map.get(m_key) or get_market(m_key)
+        pair = (m_key, addr)
 
         if isinstance(outcome, Exception):
             if isinstance(outcome, ReadError):
@@ -121,12 +174,15 @@ def poll_once(
                     addr,
                     outcome,
                 )
+            if scheduler is not None:
+                scheduler.record_failure(pair, now)
             # On error, keep previous state, send nothing to users
-            continue
+            return
 
         # Successful read
         clear_failure(db_path, m_key, addr)
         watches = list_watches_by_address(db_path, addr, market_key=m_key)
+        blocked_chats: set[int] = set()
         for watch in watches:
             chat_levels = _get_chat_levels(watch.chat_id)
             new_state, alert = step(
@@ -160,16 +216,99 @@ def poll_once(
                 except Blocked:
                     logger.info("Bot blocked by user %s; deleting all chat data", watch.chat_id)
                     delete_chat(db_path, watch.chat_id)
+                    blocked_chats.add(watch.chat_id)
                 except TelegramError as exc:
                     # Keep previous state so next poll retries this alert
                     logger.warning("Failed to send alert to %s: %s", watch.chat_id, exc)
             elif new_state != watch.state:
                 update_state(db_path, watch.chat_id, addr, m_key, new_state)
 
+        if scheduler is not None:
+            active_watches = [w for w in watches if w.chat_id not in blocked_chats]
+            if active_watches:
+                intervals = [
+                    poll_interval_for(outcome.hf, _get_chat_levels(w.chat_id))
+                    for w in active_watches
+                ]
+                next_interval = combine(intervals)
+            else:
+                next_interval = INTERVAL_FAR
+            scheduler.record_success(pair, now + next_interval)
+
+    for (m_key, addr), outcome in results.items():
+        try:
+            _handle_result(m_key, addr, outcome)
+        except Exception:  # top-level guard per pair: one bug must not skip the other pairs or cause a re-read every tick
+            logger.exception("Unexpected error while processing market %s address %s", m_key, addr)
+            if scheduler is not None:
+                scheduler.record_failure((m_key, addr), now)
+
     if heartbeat_file is not None:
         hb_path = Path(heartbeat_file)
         hb_path.parent.mkdir(parents=True, exist_ok=True)
         hb_path.write_text(f"{int(now)}\n", encoding="utf-8")
+
+
+def poll_due(
+    db_path: str | Path,
+    scheduler: PollScheduler | None = None,
+    markets: Sequence[Market] | None = None,
+    rpc_urls: Sequence[str] | None = None,
+    tg_client: Any = None,
+    reader_fn: Callable[..., AccountData] = read_market,
+    clock: Callable[[], float] = time.time,
+    heartbeat_file: str | Path | None = None,
+    concurrency_cap: int = DEFAULT_CONCURRENCY_CAP,
+    per_host_cap: int = DEFAULT_PER_HOST_CAP,
+) -> None:
+    """Execute adaptive polling cycle across due (market, address) pairs."""
+    if scheduler is not None and not isinstance(scheduler, PollScheduler):
+        markets = scheduler  # type: ignore[assignment]
+        scheduler = PollScheduler()
+    elif scheduler is None:
+        scheduler = PollScheduler()
+
+    return _poll_core(
+        db_path=db_path,
+        scheduler=scheduler,
+        poll_all=False,
+        markets=markets,
+        rpc_urls=rpc_urls,
+        tg_client=tg_client,
+        reader_fn=reader_fn,
+        clock=clock,
+        heartbeat_file=heartbeat_file,
+        concurrency_cap=concurrency_cap,
+        per_host_cap=per_host_cap,
+    )
+
+
+def poll_once(
+    db_path: str | Path,
+    markets: Sequence[Market] | None = None,
+    rpc_urls: Sequence[str] | None = None,
+    tg_client: Any = None,
+    reader_fn: Callable[..., AccountData] = read_market,
+    clock: Callable[[], float] = time.time,
+    heartbeat_file: str | Path | None = None,
+    concurrency_cap: int = DEFAULT_CONCURRENCY_CAP,
+    per_host_cap: int = DEFAULT_PER_HOST_CAP,
+    scheduler: PollScheduler | None = None,
+) -> None:
+    """Execute a single polling cycle across all distinct (market, address) pairs."""
+    return _poll_core(
+        db_path=db_path,
+        scheduler=scheduler,
+        poll_all=True,
+        markets=markets,
+        rpc_urls=rpc_urls,
+        tg_client=tg_client,
+        reader_fn=reader_fn,
+        clock=clock,
+        heartbeat_file=heartbeat_file,
+        concurrency_cap=concurrency_cap,
+        per_host_cap=per_host_cap,
+    )
 
 
 def rescan_due_addresses(
@@ -246,18 +385,25 @@ def run_poll_loop(
     rpc_urls: Sequence[str] | None = None,
     tg_client: Any = None,
     heartbeat_file: str | Path | None = None,
-    poll_interval: float = DEFAULT_POLL_INTERVAL,
+    tick_seconds: float = DEFAULT_TICK_SECONDS,
+    poll_interval: float | None = None,
     clock: Callable[[], float] = time.time,
     reader_fn: Callable[..., AccountData] = read_market,
     concurrency_cap: int = DEFAULT_CONCURRENCY_CAP,
     per_host_cap: int = DEFAULT_PER_HOST_CAP,
+    scheduler: PollScheduler | None = None,
 ) -> None:
-    """Run recurring poll loop in background until stop_event is set."""
-    logger.info("Starting poll loop (interval=%.1fs)", poll_interval)
+    """Run recurring poll loop in background ticking every tick_seconds until stop_event is set."""
+    effective_tick = poll_interval if poll_interval is not None else tick_seconds
+    if scheduler is None:
+        scheduler = PollScheduler()
+
+    logger.info("Starting poll loop (tick=%.1fs)", effective_tick)
     while not stop_event.is_set():
         try:
-            poll_once(
+            poll_due(
                 db_path=db_path,
+                scheduler=scheduler,
                 markets=markets,
                 rpc_urls=rpc_urls,
                 tg_client=tg_client,
@@ -268,9 +414,9 @@ def run_poll_loop(
                 per_host_cap=per_host_cap,
             )
         except Exception:  # top-level guard: a bug must not silently stop alerting
-            logger.exception("Unhandled error in poll_once")
+            logger.exception("Unhandled error in poll_due")
 
-        stop_event.wait(poll_interval)
+        stop_event.wait(effective_tick)
     logger.info("Poll loop stopped")
 
 
@@ -350,7 +496,8 @@ def run_all(
     markets: Sequence[Market] | None = None,
     rpc_urls: Sequence[str] | None = None,
     heartbeat_file: str | Path | None = None,
-    poll_interval: float = DEFAULT_POLL_INTERVAL,
+    tick_seconds: float = DEFAULT_TICK_SECONDS,
+    poll_interval: float | None = None,
     poll_timeout: int = 50,
 ) -> None:
     """Run poll loop, daily rescan loop, and command loop with graceful shutdown."""
@@ -367,6 +514,8 @@ def run_all(
     all_markets = list(markets) if markets is not None else load_markets()
     bot_handler = BotHandler(db_path=db_path, markets=all_markets, rpc_urls=rpc_urls or ())
 
+    effective_tick = poll_interval if poll_interval is not None else tick_seconds
+
     poll_thread = threading.Thread(
         target=run_poll_loop,
         kwargs={
@@ -376,7 +525,7 @@ def run_all(
             "rpc_urls": rpc_urls,
             "tg_client": tg_client,
             "heartbeat_file": heartbeat_file,
-            "poll_interval": poll_interval,
+            "tick_seconds": effective_tick,
         },
         daemon=True,
     )

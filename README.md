@@ -128,6 +128,31 @@ When alert levels are changed or reset with `/levels`, all current watch states 
 - **No debt**: When an account has no debt (health factor sentinel `2^256 - 1`), it is mapped to `ok` (with a recovery notification if previously non-ok).
 - **RPC failures**: On RPC node failures, the previous known state is preserved. An internal failure counter increments per `(market, address)` pair; after 3 consecutive failures an error is recorded in server logs without user-facing spam.
 
+## Polling Intervals and Backoff
+
+Positions are polled every 1 to 5 minutes depending on how close the position is to a level:
+
+| Interval | Condition |
+|---|---|
+| 60 s (near) | Health factor < 1.15, or distance to next downward level < 0.10 |
+| 120 s (approaching) | Distance to next downward level < 0.30, or health factor < 1.40 |
+| 300 s (safe) | All other positions, or accounts with no debt |
+
+When multiple chats watch the same position with different alert levels, the bot polls at the shortest calculated interval.
+
+### Failure Backoff
+
+If an RPC read fails for a position, polling backs off progressively to avoid hammering nodes:
+
+| Failure Streak | Retry Interval |
+|---|---|
+| 1 failure | 60 s |
+| 2 consecutive failures | 120 s |
+| 3 consecutive failures | 240 s |
+| 4 or more consecutive failures | 300 s |
+
+The failure streak resets to 0 immediately upon the next successful read.
+
 ## Limits
 
 - **Addresses per chat**: Maximum 3 monitored addresses per Telegram chat.
@@ -196,7 +221,7 @@ A `Dockerfile` and `docker-compose.yml` are provided for deployment:
 
 ## Limitations
 
-- Positions are polled every 5 minutes with public RPC endpoints. A fast market move can cross a level between two polls, so this is an early-warning tool, not a guarantee.
+- Positions are polled every 1 to 5 minutes depending on how close the position is to a level with public RPC endpoints. A fast market move can cross a level between two polls, so this is an early-warning tool, not a guarantee.
 - Markets marked "best effort" in the table have a single public RPC endpoint.
 - Only Aave V3 and Aave V4 are covered. Other lending protocols are not supported.
 - USD amounts are shown for Aave V3 only. Aave V4 alerts show the health factor.

@@ -7,7 +7,7 @@ import pytest
 
 from hfwb.aave import AccountData, ReadError
 from hfwb.markets import Market
-from hfwb.runner import poll_once, rescan_due_addresses
+from hfwb.runner import PollScheduler, poll_due, poll_once, rescan_due_addresses, run_poll_loop
 from hfwb.scan import ScanResult
 from hfwb.store import (
     add_tracked_address,
@@ -459,3 +459,380 @@ def test_rescan_due_addresses_uses_chat_levels(db_path: Path):
     # Emoji in notification should be 🔴 (level_emoji(1, 2))
     assert len(tg.sent_messages) == 1
     assert "🔴 <b>Aave V4 · Ethereum · Main Spoke</b>" in tg.sent_messages[0][1]
+
+
+def test_poll_due_far_position_read_every_300s_and_not_before(db_path: Path):
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    add_watch(db_path, 1001, addr, M_ARB.key, state="ok")
+
+    read_calls = 0
+
+    def far_reader(market, address):
+        nonlocal read_calls
+        read_calls += 1
+        return AccountData(Decimal(10000), Decimal(4000), Decimal("2.5"), False, True)
+
+    clock = FakeClock(1000.0)
+    scheduler = PollScheduler()
+    tg = FakeTelegramClient()
+
+    # Initial tick at 1000.0: new pair is due immediately
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=far_reader, clock=clock)
+    assert read_calls == 1
+    assert scheduler.next_due[(M_ARB.key, addr)] == 1300.0
+
+    # Advance clock to 1100 (not due yet: 1100 < 1300)
+    clock.advance(100.0)
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=far_reader, clock=clock)
+    assert read_calls == 1
+
+    # Advance clock to 1299 (not due yet)
+    clock.advance(199.0)
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=far_reader, clock=clock)
+    assert read_calls == 1
+
+    # Advance clock to 1300 (due now!)
+    clock.advance(1.0)
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=far_reader, clock=clock)
+    assert read_calls == 2
+    assert scheduler.next_due[(M_ARB.key, addr)] == 1600.0
+
+
+def test_poll_due_near_position_hf_1_12_read_every_60s(db_path: Path):
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    add_watch(db_path, 1002, addr, M_ARB.key, state="ok")
+
+    read_calls = 0
+
+    def near_reader(market, address):
+        nonlocal read_calls
+        read_calls += 1
+        return AccountData(Decimal(10000), Decimal(8900), Decimal("1.12"), False, True)
+
+    clock = FakeClock(1000.0)
+    scheduler = PollScheduler()
+    tg = FakeTelegramClient()
+
+    # Initial tick: due immediately, HF=1.12 -> interval 60s
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=near_reader, clock=clock)
+    assert read_calls == 1
+    assert scheduler.next_due[(M_ARB.key, addr)] == 1060.0
+
+    # Advance to 1059: not due
+    clock.advance(59.0)
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=near_reader, clock=clock)
+    assert read_calls == 1
+
+    # Advance to 1060: due!
+    clock.advance(1.0)
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=near_reader, clock=clock)
+    assert read_calls == 2
+    assert scheduler.next_due[(M_ARB.key, addr)] == 1120.0
+
+
+def test_poll_due_moving_from_far_to_near_shortens_next_interval(db_path: Path):
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    add_watch(db_path, 1003, addr, M_ARB.key, state="ok")
+
+    current_hf = Decimal("2.0")
+    read_calls = 0
+
+    def dynamic_reader(market, address):
+        nonlocal read_calls
+        read_calls += 1
+        return AccountData(Decimal(10000), Decimal(5000), current_hf, False, True)
+
+    clock = FakeClock(1000.0)
+    scheduler = PollScheduler()
+    tg = FakeTelegramClient()
+
+    # 1st read at 1000: far position (HF 2.0) -> next due 1300
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=dynamic_reader, clock=clock)
+    assert read_calls == 1
+    assert scheduler.next_due[(M_ARB.key, addr)] == 1300.0
+
+    # Advance clock to 1300; position drops to near (HF 1.12)
+    clock.advance(300.0)
+    current_hf = Decimal("1.12")
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=dynamic_reader, clock=clock)
+    assert read_calls == 2
+    # Interval shortened to 60s -> next due 1360
+    assert scheduler.next_due[(M_ARB.key, addr)] == 1360.0
+
+    # Advance clock to 1360: due!
+    clock.advance(60.0)
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=dynamic_reader, clock=clock)
+    assert read_calls == 3
+
+
+def test_poll_due_two_chats_different_levels_use_shorter_interval(db_path: Path):
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    # Chat 1004 has custom levels: (2.0, 1.5, 1.25)
+    # At HF = 1.70: d = 1.70 - 1.50 = 0.20 < 0.30 -> interval 120s
+    set_levels(db_path, 1004, (Decimal("2.0"), Decimal("1.5"), Decimal("1.25")))
+    add_watch(db_path, 1004, addr, M_ARB.key, state="ok")
+
+    # Chat 1005 has default levels: (1.4, 1.2, 1.1, 1.05)
+    # At HF = 1.70: d = 1.70 - 1.40 = 0.30 >= 0.30, hf >= 1.4 -> interval 300s
+    add_watch(db_path, 1005, addr, M_ARB.key, state="ok")
+
+    read_calls = 0
+
+    def reader(market, address):
+        nonlocal read_calls
+        read_calls += 1
+        return AccountData(Decimal(10000), Decimal(5800), Decimal("1.70"), False, True)
+
+    clock = FakeClock(1000.0)
+    scheduler = PollScheduler()
+    tg = FakeTelegramClient()
+
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=reader, clock=clock)
+    assert read_calls == 1
+    # Shorter interval: min(120, 300) = 120s -> next due 1120.0
+    assert scheduler.next_due[(M_ARB.key, addr)] == 1120.0
+
+    # Advance to 1119: not due
+    clock.advance(119.0)
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=reader, clock=clock)
+    assert read_calls == 1
+
+    # Advance to 1120: due!
+    clock.advance(1.0)
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=reader, clock=clock)
+    assert read_calls == 2
+
+
+def test_poll_due_failure_backoff_and_reset_on_success(db_path: Path):
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    add_watch(db_path, 1006, addr, M_ARB.key, state="ok")
+
+    should_fail = True
+
+    def flake_reader(market, address):
+        if should_fail:
+            raise ReadError("RPC Timeout")
+        return AccountData(Decimal(10000), Decimal(4000), Decimal("2.5"), False, True)
+
+    clock = FakeClock(1000.0)
+    scheduler = PollScheduler()
+    tg = FakeTelegramClient()
+
+    # 1st failure: streak 1 -> backoff 60 -> next_due 1060
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=flake_reader, clock=clock)
+    assert scheduler.next_due[(M_ARB.key, addr)] == 1060.0
+
+    # 2nd failure at 1060: streak 2 -> backoff 120 -> next_due 1180
+    clock.advance(60.0)
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=flake_reader, clock=clock)
+    assert scheduler.next_due[(M_ARB.key, addr)] == 1180.0
+
+    # 3rd failure at 1180: streak 3 -> backoff 240 -> next_due 1420
+    clock.advance(120.0)
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=flake_reader, clock=clock)
+    assert scheduler.next_due[(M_ARB.key, addr)] == 1420.0
+
+    # 4th failure at 1420: streak 4 -> backoff 300 -> next_due 1720
+    clock.advance(240.0)
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=flake_reader, clock=clock)
+    assert scheduler.next_due[(M_ARB.key, addr)] == 1720.0
+
+    # 5th failure at 1720: streak 5 -> backoff 300 -> next_due 2020
+    clock.advance(300.0)
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=flake_reader, clock=clock)
+    assert scheduler.next_due[(M_ARB.key, addr)] == 2020.0
+
+    # Success at 2020: streak reset, safe position -> next_due = 2020 + 300 = 2320
+    clock.advance(300.0)
+    should_fail = False
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=flake_reader, clock=clock)
+    assert scheduler.next_due[(M_ARB.key, addr)] == 2320.0
+    assert scheduler.get_fail_streak((M_ARB.key, addr)) == 0
+
+    # Failure again at 2320: streak starts fresh at 1 -> backoff 60 -> next_due = 2380
+    clock.advance(300.0)
+    should_fail = True
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=flake_reader, clock=clock)
+    assert scheduler.next_due[(M_ARB.key, addr)] == 2380.0
+    assert scheduler.get_fail_streak((M_ARB.key, addr)) == 1
+
+
+def test_poll_due_pair_removed_from_db_is_forgotten(db_path: Path):
+    from hfwb.store import delete_chat
+
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    add_watch(db_path, 1007, addr, M_ARB.key, state="ok")
+
+    clock = FakeClock(1000.0)
+    scheduler = PollScheduler()
+    tg = FakeTelegramClient()
+
+    def reader(market, address):
+        return AccountData(Decimal(10000), Decimal(4000), Decimal("2.5"), False, True)
+
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=reader, clock=clock)
+    pair = (M_ARB.key, addr)
+    assert pair in scheduler.next_due
+
+    # Remove watch by deleting chat
+    delete_chat(db_path, 1007)
+    assert pair not in distinct_pairs(db_path)
+
+    # Next cycle prunes forgotten pair
+    clock.advance(15.0)
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=reader, clock=clock)
+    assert pair not in scheduler.next_due
+    assert pair not in scheduler.fail_streak
+
+
+def test_poll_due_heartbeat_written_on_tick_with_nothing_due(db_path: Path, tmp_path: Path):
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    add_watch(db_path, 1008, addr, M_ARB.key, state="ok")
+
+    read_calls = 0
+
+    def reader(market, address):
+        nonlocal read_calls
+        read_calls += 1
+        return AccountData(Decimal(10000), Decimal(4000), Decimal("2.5"), False, True)
+
+    clock = FakeClock(1000.0)
+    scheduler = PollScheduler()
+    tg = FakeTelegramClient()
+    hb = tmp_path / "heartbeat.txt"
+
+    # Initial poll at 1000: read once, next due 1300, hb = 1000
+    poll_due(
+        db_path,
+        scheduler=scheduler,
+        markets=[M_ARB],
+        tg_client=tg,
+        reader_fn=reader,
+        clock=clock,
+        heartbeat_file=hb,
+    )
+    assert read_calls == 1
+    assert hb.read_text().strip() == "1000"
+
+    # Tick at 1015: nothing is due
+    clock.advance(15.0)
+    poll_due(
+        db_path,
+        scheduler=scheduler,
+        markets=[M_ARB],
+        tg_client=tg,
+        reader_fn=reader,
+        clock=clock,
+        heartbeat_file=hb,
+    )
+    # Reader was NOT called
+    assert read_calls == 1
+    # But heartbeat file was updated
+    assert hb.read_text().strip() == "1015"
+
+
+def test_poll_due_reader_called_once_per_due_pair_per_tick(db_path: Path):
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    # 3 chats watching the exact same (market, address) pair
+    add_watch(db_path, 1009, addr, M_ARB.key, state="ok")
+    add_watch(db_path, 1010, addr, M_ARB.key, state="ok")
+    add_watch(db_path, 1011, addr, M_ARB.key, state="ok")
+
+    read_calls: list[tuple[str, str]] = []
+
+    def reader(market, address):
+        read_calls.append((market.key, address))
+        return AccountData(Decimal(10000), Decimal(4000), Decimal("2.5"), False, True)
+
+    clock = FakeClock(1000.0)
+    scheduler = PollScheduler()
+    tg = FakeTelegramClient()
+
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=reader, clock=clock)
+    assert len(read_calls) == 1
+    assert read_calls[0] == (M_ARB.key, addr)
+
+
+def test_run_poll_loop_tick_seconds_and_heartbeat(db_path: Path, tmp_path: Path):
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    add_watch(db_path, 1012, addr, M_ARB.key, state="ok")
+
+    hb = tmp_path / "hb_loop.txt"
+    clock = FakeClock(5000.0)
+    scheduler = PollScheduler()
+    stop_event = threading.Event()
+
+    calls = 0
+
+    def counting_reader(market, address):
+        nonlocal calls
+        calls += 1
+        return AccountData(Decimal(10000), Decimal(4000), Decimal("2.5"), False, True)
+
+    # Pre-set stop_event so run_poll_loop executes exactly one iteration if checked, or we use a thread
+    t = threading.Thread(
+        target=run_poll_loop,
+        kwargs={
+            "stop_event": stop_event,
+            "db_path": db_path,
+            "markets": [M_ARB],
+            "reader_fn": counting_reader,
+            "clock": clock,
+            "heartbeat_file": hb,
+            "tick_seconds": 0.05,
+            "scheduler": scheduler,
+        },
+    )
+    t.start()
+    # Give it a short moment to run tick
+    stop_event.wait(0.08)
+    stop_event.set()
+    t.join(timeout=2.0)
+
+    assert calls >= 1
+    assert hb.is_file()
+    assert hb.read_text().strip() == "5000"
+
+
+
+
+def test_poll_due_unexpected_error_while_processing_backs_off_and_isolates(db_path: Path):
+    addr_bad = "0x1111111111111111111111111111111111111111"
+    addr_ok = "0x2222222222222222222222222222222222222222"
+    add_watch(db_path, 3001, addr_bad, M_ARB.key, state="ok")
+    add_watch(db_path, 3002, addr_ok, M_ARB.key, state="ok")
+
+    class ExplodingTelegram:
+        """Unexpected (non-Telegram) error while sending the alert of the first chat only."""
+
+        def __init__(self) -> None:
+            self.sent: list[int] = []
+
+        def send_message(self, chat_id: int, text: str) -> dict:
+            if chat_id == 3001:
+                raise RuntimeError("unexpected bug")
+            self.sent.append(chat_id)
+            return {"ok": True}
+
+    def reader(market, address):  # both positions are in danger, so both try to alert
+        return AccountData(Decimal(10000), Decimal(9000), Decimal("1.1"), False, True)
+
+    clock = FakeClock(1000.0)
+    scheduler = PollScheduler()
+    tg = ExplodingTelegram()
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=reader, clock=clock)
+
+    assert tg.sent == [3002]  # the healthy pair was still processed
+    bad = (M_ARB.key, addr_bad)
+    assert scheduler.next_due[bad] == 1060.0  # backed off (60 s), not re-read on every tick
+    assert scheduler.get_fail_streak(bad) == 1
+    # one tick later (15 s) the bad pair is NOT read again
+    reads: list[str] = []
+
+    def counting_reader(market, address):
+        reads.append(address)
+        return reader(market, address)
+
+    clock.advance(15.0)
+    poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=counting_reader, clock=clock)
+    assert addr_bad not in reads
