@@ -1,0 +1,88 @@
+{
+ "coins": {
+  "ethereum:0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48": {
+   "decimals": 6,
+   "symbol": "USDC",
+   "price": 1.0000633787250823,
+   "timestamp": 1791112010,
+   "confidence": 0.99
+  },
+  "ethereum:0xdAC17F958D2ee523a2206206994597C13D831ec7": {
+   "decimals": 6,
+   "symbol": "USDT",
+   "price": 0.9998733451808923,
+   "timestamp": 1791112010,
+   "confidence": 0.99
+  },
+  "ethereum:0x6B175474E89094C44Da98b954EedeAC495271d0F": {
+   "decimals": 18,
+   "symbol": "DAI",
+   "price": 1.0000255014384947,
+   "timestamp": 1791112010,
+   "confidence": 0.99
+  },
+  "ethereum:0xdC035D45d973E3EC169d2276DDab16f1e407384F": {
+   "decimals": 18,
+   "symbol": "USDS",
+   "price": 1.0000230279159512,
+   "timestamp": 1791111710,
+   "confidence": 0.99
+  },
+  "ethereum:0x40D16FC0246aD3160Ccc09B8D0D3A2cD28aE6C2f": {
+   "decimals": 18,
+   "symbol": "GHO",
+   "price": 0.9993934190661818,
+   "timestamp": 1791111120,
+   "confidence": 0.99
+  },
+  "ethereum:0x4c9EDD5852cd905f086C759E8383e09bff1E68B3": {
+   "decimals": 18,
+   "symbol": "USDe",
+   "price": 0.9996788220517181,
+   "timestamp": 1791111710,
+   "confidence": 0.99
+  },
+  "ethereum:0x6c3ea9036406852006290770BEdFcAbA0e23A0e8": {
+   "decimals": 6,
+   "symbol": "PYUSD",
+   "price": 1.0000915721144474,
+   "timestamp": 1791111710,
+   "confidence": 0.99
+  },
+  "ethereum:0x8292Bb45bf1Ee4d140127049757C2E0fF06317eD": {
+   "decimals": 18,
+   "symbol": "RLUSD",
+   "price": 1.000004396589307,
+   "timestamp": 1791111710,
+   "confidence": 0.99
+  },
+  "ethereum:0xe343167631d89B6Ffc58B88d6b7fB0228795491D": {
+   "decimals": 6,
+   "symbol": "USDG",
+   "price": 1.0000201343768944,
+   "timestamp": 1791112010,
+   "confidence": 0.99
+  },
+  "ethereum:0xCAcd6fd266aF91b8AeD52aCCc382b4e165586E29": {
+   "decimals": 18,
+   "symbol": "frxUSD",
+   "price": 0.9999169100525076,
+   "timestamp": 1791111100,
+   "confidence": 0.99
+  },
+  "ethereum:0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E": {
+   "decimals": 18,
+   "symbol": "crvUSD",
+   "price": 0.9997238649879113,
+   "timestamp": 1791111110,
+   "confidence": 0.99
+  },
+  "ethereum:0xc5f0f7b66764F6ec8C8Dff7BA683102295E16409": {
+   "decimals": 18,
+   "symbol": "FDUSD",
+   "price": 0.9990447915105463,
+   "timestamp": 1791111710,
+   "confidence": 0.99
+  }
+ }
+}
