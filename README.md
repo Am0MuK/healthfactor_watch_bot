@@ -133,7 +133,7 @@ A background worker checks tracked addresses once every 24 hours. When an addres
 
 ## Configuration and Secrets
 
-Configuration is loaded from the file specified in `HFWB_ENV_FILE` (default: `/data/services/healthfactor_watch_bot/.env`) and environment variables:
+Configuration is loaded from the file specified in `HFWB_ENV_FILE` (default: `.env` in the working directory; with Docker Compose the same file is passed as `env_file`) and environment variables:
 
 | Variable | Description | Required |
 |---|---|---|

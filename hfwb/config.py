@@ -2,7 +2,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_ENV_FILE = "/data/services/healthfactor_watch_bot/.env"
+DEFAULT_ENV_FILE = ".env"
 DEFAULT_DB_PATH = "/data/services/healthfactor_watch_bot/bot.db"
 DEFAULT_HEARTBEAT = "/data/services/healthfactor_watch_bot/heartbeat"
 DEFAULT_POLL_INTERVAL = 300.0

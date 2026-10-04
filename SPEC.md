@@ -20,7 +20,7 @@ Stablecoin depeg alerts, Uniswap LP out-of-range alerts, other chains, per-user 
 - Poll loop every 5 min, one RPC call per distinct address (shared across chats), small concurrency cap.
 - RPC: public endpoints, ordered primary then fallback (see `hfwb/markets.json`).
 - Fail loudly: an RPC error, empty or reverted response never evaluates to ok/0. The address keeps its previous state, and after 3 consecutive failures the bot logs an error (no per-user spam).
-- Secrets only in `/data/services/healthfactor_watch_bot/.env` (mode 600): `TELEGRAM_BOT_TOKEN`, `RPC_URL`. Logs redact both.
+- Secrets only in `.env` next to the code (git-ignored, mode 600): `TELEGRAM_BOT_TOKEN`, `RPC_URL`. Logs redact both.
 
 ## Privacy
 Stores chat_id + address + alert state only. `/delete` removes all rows for the chat. `/privacy` says exactly this. Wallet addresses are public on chain but still personal data under GDPR, so retention is "until /remove or /delete", plus auto-removal of chats where Telegram returns "bot was blocked".
