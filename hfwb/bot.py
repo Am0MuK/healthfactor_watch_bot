@@ -6,8 +6,13 @@ from pathlib import Path
 from typing import Any
 
 from hfwb.aave import AccountData, normalize_address, read_market
+from hfwb.depeg import STABLES
 from hfwb.format import (
     format_delete,
+    format_depeg_error,
+    format_depeg_off,
+    format_depeg_on,
+    format_depeg_status,
     format_help,
     format_invalid_address,
     format_levels,
@@ -31,13 +36,16 @@ from hfwb.scan import ScanResult, scan_address
 from hfwb.state import DEFAULT_LEVELS, step, validate_levels
 from hfwb.store import (
     LimitError,
+    add_depeg_subs,
     add_tracked_address,
     add_watch,
     delete_chat,
     get_levels,
+    list_depeg_subs,
     list_tracked_addresses,
     list_watches,
     remove_address,
+    remove_depeg_subs,
     reset_levels,
     set_levels,
     update_last_scan_ts,
@@ -134,6 +142,53 @@ class BotHandler:
 
             set_levels(self.db_path, chat_id, new_levels)
             return [(chat_id, format_levels_saved(new_levels))]
+
+        if cmd == "/depeg":
+            arg_str = text[len(tokens[0]):].strip()
+            if not arg_str:
+                subs = list_depeg_subs(self.db_path, chat_id)
+                return [(chat_id, format_depeg_status(subs))]
+
+            raw_tokens = [tok for tok in re.split(r"[\s,]+", arg_str) if tok]
+            sub_cmd = raw_tokens[0].lower()
+            symbols_args = raw_tokens[1:]
+            canonical_map = {k.lower(): k for k in STABLES}
+
+            if sub_cmd == "on":
+                if not symbols_args:
+                    add_depeg_subs(self.db_path, chat_id, list(STABLES.keys()))
+                    return [(chat_id, format_depeg_on(list(STABLES.keys())))]
+
+                valid_symbols: list[str] = []
+                for s in symbols_args:
+                    s_clean = s.strip().lower()
+                    if s_clean not in canonical_map:
+                        return [(chat_id, format_depeg_error(s, list(STABLES.keys())))]
+                    canon = canonical_map[s_clean]
+                    if canon not in valid_symbols:
+                        valid_symbols.append(canon)
+
+                add_depeg_subs(self.db_path, chat_id, valid_symbols)
+                return [(chat_id, format_depeg_on(valid_symbols))]
+
+            if sub_cmd == "off":
+                if not symbols_args:
+                    remove_depeg_subs(self.db_path, chat_id, None)
+                    return [(chat_id, format_depeg_off())]
+
+                valid_symbols = []
+                for s in symbols_args:
+                    s_clean = s.strip().lower()
+                    if s_clean not in canonical_map:
+                        return [(chat_id, format_depeg_error(s, list(STABLES.keys())))]
+                    canon = canonical_map[s_clean]
+                    if canon not in valid_symbols:
+                        valid_symbols.append(canon)
+
+                remove_depeg_subs(self.db_path, chat_id, valid_symbols)
+                return [(chat_id, format_depeg_off(valid_symbols))]
+
+            return [(chat_id, format_depeg_error(raw_tokens[0], list(STABLES.keys())))]
 
         if cmd == "/list":
             chat_levels = get_levels(self.db_path, chat_id)

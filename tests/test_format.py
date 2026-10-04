@@ -7,6 +7,11 @@ from hfwb.format import (
     drop_to_liquidation_pct,
     format_alert,
     format_delete,
+    format_depeg_alert,
+    format_depeg_error,
+    format_depeg_off,
+    format_depeg_on,
+    format_depeg_status,
     format_help,
     format_levels,
     format_levels_error,
@@ -470,3 +475,172 @@ def test_format_levels_functions():
     msg_reset = format_levels_reset()
     assert "1.4 / 1.2 / 1.1 / 1.05" in msg_reset
     assert_no_forbidden_words(msg_reset)
+
+
+def test_format_depeg_alert_d1_below():
+    msg = format_depeg_alert(
+        alert_type="D1",
+        symbol="USDC",
+        price=Decimal("0.9940"),
+        readings_age_s=120.0,
+        oracle_price=Decimal("0.9998"),
+    )
+    assert "🟡 <b>USDC price alert</b>" in msg
+    assert "Price <b>$0.9940</b> (0.60% below $1.00)" in msg
+    assert "Fell past <b>0.5%</b> from the peg" in msg
+    assert "Market price (DefiLlama), updated 2 min ago" in msg
+    assert "Aave oracle: $0.9998" in msg
+    assert "Large move" not in msg
+    assert "Aggregated market price; it can differ between exchanges and chains." in msg
+    assert_no_forbidden_words(msg)
+
+
+def test_format_depeg_alert_d2_above():
+    msg = format_depeg_alert(
+        alert_type="D2",
+        symbol="USDC",
+        price=Decimal("1.0129"),
+        readings_age_s=45.0,
+        oracle_price=None,
+    )
+    assert "🟠 <b>USDC price alert</b>" in msg
+    assert "Price <b>$1.0129</b> (1.29% above $1.00)" in msg
+    assert "Rose past <b>1%</b> from the peg" in msg
+    assert "Market price (DefiLlama), updated just now" in msg
+    assert "Aave oracle" not in msg
+    assert "Large move" not in msg
+    assert_no_forbidden_words(msg)
+
+
+def test_format_depeg_alert_d3_and_d4_large_move():
+    msg3 = format_depeg_alert(
+        alert_type="D3",
+        symbol="DAI",
+        price=Decimal("0.9780"),
+        readings_age_s=60.0,
+    )
+    assert "🔴 <b>DAI price alert</b>" in msg3
+    assert "Fell past <b>2%</b> from the peg" in msg3
+    assert "<b>Large move</b>" in msg3
+    assert_no_forbidden_words(msg3)
+
+    msg4 = format_depeg_alert(
+        alert_type="D4",
+        symbol="USDT",
+        price=Decimal("0.9400"),
+        readings_age_s=180.0,
+    )
+    assert "🚨 <b>USDT price alert</b>" in msg4
+    assert "Fell past <b>5%</b> from the peg" in msg4
+    assert "<b>Large move</b>" in msg4
+    assert_no_forbidden_words(msg4)
+
+
+def test_format_depeg_alert_repeats():
+    rep3 = format_depeg_alert(
+        alert_type="repeat_D3",
+        symbol="USDC",
+        price=Decimal("0.9780"),
+        readings_age_s=120.0,
+    )
+    assert "🔴 <b>USDC price alert</b>" in rep3
+    assert "Still more than 2% from the peg" in rep3
+    assert "<b>Large move</b>" in rep3
+    assert_no_forbidden_words(rep3)
+
+    rep4 = format_depeg_alert(
+        alert_type="repeat_D4",
+        symbol="USDC",
+        price=Decimal("0.9400"),
+        readings_age_s=120.0,
+    )
+    assert "🚨 <b>USDC price alert</b>" in rep4
+    assert "Still more than 5% from the peg" in rep4
+    assert "<b>Large move</b>" in rep4
+    assert_no_forbidden_words(rep4)
+
+
+def test_format_depeg_alert_recovery():
+    rec = format_depeg_alert(
+        alert_type="recovery",
+        symbol="USDC",
+        price=Decimal("0.9985"),
+        readings_age_s=60.0,
+    )
+    assert "🟢 <b>USDC price alert</b>" in rec
+    assert "Back within 0.3% of $1.00" in rec
+    assert "Large move" not in rec
+    assert_no_forbidden_words(rec)
+
+
+def test_format_depeg_alert_oracle_not_independent():
+    for sym in ("GHO", "USDe"):
+        msg = format_depeg_alert(
+            alert_type="D1",
+            symbol=sym,
+            price=Decimal("0.9940"),
+            readings_age_s=60.0,
+            oracle_price=Decimal("1.0000"),
+        )
+        assert "Aave oracle: not independent (fixed or proxy price)" in msg
+        assert_no_forbidden_words(msg)
+
+
+def test_format_depeg_alert_html_escape():
+    msg = format_depeg_alert(
+        alert_type="D1",
+        symbol="<bad>&token",
+        price=Decimal("0.9940"),
+        readings_age_s=60.0,
+    )
+    assert "<bad>" not in msg
+    assert "&lt;bad&gt;&amp;token" in msg
+
+
+def test_format_depeg_status():
+    off_msg = format_depeg_status([])
+    assert "off" in off_msg.lower()
+    assert_no_forbidden_words(off_msg)
+
+    on_subs = [
+        type("Sub", (), {"symbol": "USDC", "state": "ok"})(),
+        type("Sub", (), {"symbol": "USDT", "state": "D1"})(),
+    ]
+    on_msg = format_depeg_status(on_subs)
+    assert "USDC" in on_msg
+    assert "USDT" in on_msg
+    assert "🟢" in on_msg
+    assert "🟡" in on_msg
+    assert_no_forbidden_words(on_msg)
+
+
+def test_format_depeg_on_and_off():
+    msg_on = format_depeg_on(["USDC", "USDT"])
+    assert "USDC, USDT" in msg_on
+    assert_no_forbidden_words(msg_on)
+
+    msg_off_all = format_depeg_off()
+    assert "off" in msg_off_all.lower()
+    assert_no_forbidden_words(msg_off_all)
+
+    msg_off_some = format_depeg_off(["USDC"])
+    assert "USDC" in msg_off_some
+    assert_no_forbidden_words(msg_off_some)
+
+
+def test_format_depeg_error():
+    err_msg = format_depeg_error("FOO", ["USDC", "USDT"])
+    assert "FOO" in err_msg
+    assert "USDC, USDT" in err_msg
+    assert_no_forbidden_words(err_msg)
+
+
+def test_privacy_and_help_include_depeg():
+    priv = format_privacy()
+    assert "stablecoin" in priv.lower() or "subscribed" in priv.lower()
+    assert_no_forbidden_words(priv)
+
+    hlp = format_help()
+    assert "/depeg" in hlp
+    assert_no_forbidden_words(hlp)
+

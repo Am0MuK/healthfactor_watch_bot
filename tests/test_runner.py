@@ -836,3 +836,314 @@ def test_poll_due_unexpected_error_while_processing_backs_off_and_isolates(db_pa
     clock.advance(15.0)
     poll_due(db_path, scheduler=scheduler, markets=[M_ARB], tg_client=tg, reader_fn=counting_reader, clock=clock)
     assert addr_bad not in reads
+
+
+def test_depeg_loop_no_subscribers_skips_fetch(db_path: Path):
+    from hfwb.depeg import DepegTracker
+    from hfwb.runner import check_depeg_cycle
+
+    called = False
+
+    def fake_fetcher():
+        nonlocal called
+        called = True
+        return {}
+
+    tracker = DepegTracker()
+    tg = FakeTelegramClient()
+    check_depeg_cycle(db_path, tg_client=tg, tracker=tracker, fetcher_fn=fake_fetcher)
+    assert not called
+    assert len(tg.sent_messages) == 0
+
+
+def test_depeg_loop_fetch_and_alert_lifecycle(db_path: Path):
+    from hfwb.depeg import DepegTracker, PriceReading
+    from hfwb.runner import check_depeg_cycle
+    from hfwb.store import add_depeg_subs, list_depeg_subs
+
+    chat_id = 901
+    add_depeg_subs(db_path, chat_id, ["USDC"])
+
+    now = 1000.0
+    tracker = DepegTracker()
+    tg = FakeTelegramClient()
+
+    # Reading showing 0.6% deviation (D1)
+    readings = {
+        "USDC": PriceReading(symbol="USDC", price=Decimal("0.9940"), confidence=0.99, timestamp=int(now - 10))
+    }
+
+    # First cycle: not confirmed yet (1 poll at D1)
+    check_depeg_cycle(
+        db_path,
+        tg_client=tg,
+        tracker=tracker,
+        fetcher_fn=lambda: readings,
+        oracle_fn=lambda sym, rpcs: Decimal("0.9998"),
+        clock=lambda: now,
+    )
+    assert len(tg.sent_messages) == 0
+    subs = list_depeg_subs(db_path, chat_id)
+    assert subs[0].state == "ok"
+    assert subs[0].last_alert_ts is None
+
+    # Second cycle (60s later): confirmed! Alert sent, state updated to D1
+    now += 60.0
+    readings["USDC"] = PriceReading(symbol="USDC", price=Decimal("0.9940"), confidence=0.99, timestamp=int(now - 10))
+    check_depeg_cycle(
+        db_path,
+        tg_client=tg,
+        tracker=tracker,
+        fetcher_fn=lambda: readings,
+        oracle_fn=lambda sym, rpcs: Decimal("0.9998"),
+        clock=lambda: now,
+    )
+    assert len(tg.sent_messages) == 1
+    assert tg.sent_messages[0][0] == chat_id
+    assert "USDC price alert" in tg.sent_messages[0][1]
+    assert "Aave oracle: $0.9998" in tg.sent_messages[0][1]
+
+    subs = list_depeg_subs(db_path, chat_id)
+    assert subs[0].state == "D1"
+    assert subs[0].last_alert_ts == now
+
+
+def test_depeg_loop_price_error_logging(db_path: Path, caplog):
+    from hfwb.depeg import DepegTracker, PriceError
+    from hfwb.runner import DepegLoopState, check_depeg_cycle
+    from hfwb.store import add_depeg_subs
+
+    chat_id = 902
+    add_depeg_subs(db_path, chat_id, ["USDC"])
+
+    tracker = DepegTracker()
+    tg = FakeTelegramClient()
+    state = DepegLoopState()
+    clock = FakeClock(1000.0)
+
+    def failing_fetcher():
+        raise PriceError("DefiLlama error")
+
+    with caplog.at_level(logging.WARNING):
+        # 4 consecutive failures -> warnings, no error log
+        for _ in range(4):
+            check_depeg_cycle(
+                db_path,
+                tg_client=tg,
+                tracker=tracker,
+                fetcher_fn=failing_fetcher,
+                clock=clock,
+                error_state=state,
+            )
+            clock.advance(60.0)
+
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 0
+
+        # 5th failure -> logs ONE error
+        check_depeg_cycle(
+            db_path,
+            tg_client=tg,
+            tracker=tracker,
+            fetcher_fn=failing_fetcher,
+            clock=clock,
+            error_state=state,
+        )
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "5 consecutive" in errors[0].getMessage()
+
+        # Next failures within 30 min (1800s) -> no additional error log
+        clock.advance(60.0)
+        check_depeg_cycle(
+            db_path,
+            tg_client=tg,
+            tracker=tracker,
+            fetcher_fn=failing_fetcher,
+            clock=clock,
+            error_state=state,
+        )
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+
+        # After 30 minutes, if still failing -> logs another error
+        clock.advance(1800.0)
+        check_depeg_cycle(
+            db_path,
+            tg_client=tg,
+            tracker=tracker,
+            fetcher_fn=failing_fetcher,
+            clock=clock,
+            error_state=state,
+        )
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 2
+
+    # Users are NEVER messaged about PriceErrors
+    assert len(tg.sent_messages) == 0
+
+
+def test_depeg_loop_lost_alert_rule(db_path: Path):
+    from hfwb.depeg import DepegTracker, PriceReading
+    from hfwb.runner import check_depeg_cycle
+    from hfwb.store import add_depeg_subs, list_depeg_subs
+    from hfwb.telegram import TelegramError
+
+    chat_id = 903
+    add_depeg_subs(db_path, chat_id, ["USDC"])
+
+    class FailingTelegramClient:
+        def send_message(self, cid, text):
+            raise TelegramError("Temporary network glitch")
+
+    tracker = DepegTracker()
+    tracker.observe("USDC", Decimal("0.006"), timestamp=1)  # earlier data point, so the next one is confirmed
+
+    now = 1000.0
+    readings = {
+        "USDC": PriceReading(symbol="USDC", price=Decimal("0.9940"), confidence=0.99, timestamp=int(now - 10))
+    }
+
+    check_depeg_cycle(
+        db_path,
+        tg_client=FailingTelegramClient(),
+        tracker=tracker,
+        fetcher_fn=lambda: readings,
+        clock=lambda: now,
+    )
+
+    # State in DB was NOT updated because send failed (lost alert rule)
+    subs = list_depeg_subs(db_path, chat_id)
+    assert subs[0].state == "ok"
+    assert subs[0].last_alert_ts is None
+
+
+def test_depeg_loop_blocked_user_deleted(db_path: Path):
+    from hfwb.depeg import DepegTracker, PriceReading
+    from hfwb.runner import check_depeg_cycle
+    from hfwb.store import add_depeg_subs, list_depeg_subs
+
+    chat_id = 904
+    add_depeg_subs(db_path, chat_id, ["USDC"])
+
+    tg = FakeTelegramClient(blocked_chats={chat_id})
+    tracker = DepegTracker()
+    tracker.observe("USDC", Decimal("0.006"), timestamp=1)
+
+    now = 1000.0
+    readings = {
+        "USDC": PriceReading(symbol="USDC", price=Decimal("0.9940"), confidence=0.99, timestamp=int(now - 10))
+    }
+
+    check_depeg_cycle(
+        db_path,
+        tg_client=tg,
+        tracker=tracker,
+        fetcher_fn=lambda: readings,
+        clock=lambda: now,
+    )
+
+    # Chat deleted because bot was blocked
+    subs = list_depeg_subs(db_path, chat_id)
+    assert len(subs) == 0
+
+
+def test_run_depeg_loop_runs_and_stops(db_path: Path):
+    import threading
+
+    from hfwb.depeg import DepegTracker
+    from hfwb.runner import run_depeg_loop
+
+    stop_event = threading.Event()
+    stop_event.set()  # Stop immediately
+
+    # Should exit cleanly without hanging
+    run_depeg_loop(
+        stop_event=stop_event,
+        db_path=db_path,
+        tg_client=FakeTelegramClient(),
+        tracker=DepegTracker(),
+        tick_seconds=0.01,
+    )
+
+
+
+def _depeg_readings(price: str, now: float):
+    from hfwb.depeg import PriceReading
+
+    return {"USDC": PriceReading(symbol="USDC", price=Decimal(price), confidence=0.99, timestamp=int(now - 10))}
+
+
+def test_depeg_fast_collapse_alerts_on_every_step_without_waiting_for_a_plateau(db_path: Path):
+    from hfwb.depeg import DepegTracker
+    from hfwb.runner import check_depeg_cycle
+    from hfwb.store import add_depeg_subs, list_depeg_subs
+
+    add_depeg_subs(db_path, 950, ["USDC"])
+    tracker, tg, now = DepegTracker(), FakeTelegramClient(), 1000.0
+    states, counts = [], []
+    for price in ["0.9900", "0.9700", "0.9300", "0.9000"]:  # 1%, 3%, 7%, 10% below the peg: a new level each minute
+        check_depeg_cycle(
+            db_path, tg_client=tg, tracker=tracker, fetcher_fn=lambda p=price, n=now: _depeg_readings(p, n),
+            oracle_fn=lambda sym, rpcs: None, clock=lambda n=now: n,
+        )
+        states.append(list_depeg_subs(db_path, 950)[0].state)
+        counts.append(len(tg.sent_messages))
+        now += 60.0
+    assert states == ["ok", "D2", "D3", "D4"]  # one poll behind the price, but never silent
+    assert counts == [0, 1, 2, 3]
+
+
+def test_depeg_single_glitch_reading_never_alerts(db_path: Path):
+    from hfwb.depeg import DepegTracker
+    from hfwb.runner import check_depeg_cycle
+    from hfwb.store import add_depeg_subs
+
+    add_depeg_subs(db_path, 951, ["USDC"])
+    tracker, tg, now = DepegTracker(), FakeTelegramClient(), 1000.0
+    for price in ["1.0000", "0.9000", "1.0000", "1.0001"]:  # one bad print in the middle
+        check_depeg_cycle(
+            db_path, tg_client=tg, tracker=tracker, fetcher_fn=lambda p=price, n=now: _depeg_readings(p, n),
+            oracle_fn=lambda sym, rpcs: None, clock=lambda n=now: n,
+        )
+        now += 60.0
+    assert tg.sent_messages == []
+
+
+def test_depeg_price_outage_resets_confirmation(db_path: Path):
+    from hfwb.depeg import DepegTracker, PriceError
+    from hfwb.runner import check_depeg_cycle
+    from hfwb.store import add_depeg_subs
+
+    add_depeg_subs(db_path, 952, ["USDC"])
+    tracker, tg = DepegTracker(), FakeTelegramClient()
+    check_depeg_cycle(db_path, tg_client=tg, tracker=tracker, fetcher_fn=lambda: _depeg_readings("0.9000", 1000.0),
+                      oracle_fn=lambda s, r: None, clock=lambda: 1000.0)
+
+    def boom():
+        raise PriceError("down")
+
+    check_depeg_cycle(db_path, tg_client=tg, tracker=tracker, fetcher_fn=boom, oracle_fn=lambda s, r: None,
+                      clock=lambda: 1060.0)
+    # first reading after the outage is a "first" reading again: no alert yet
+    check_depeg_cycle(db_path, tg_client=tg, tracker=tracker, fetcher_fn=lambda: _depeg_readings("0.9000", 1120.0),
+                      oracle_fn=lambda s, r: None, clock=lambda: 1120.0)
+    assert tg.sent_messages == []
+
+
+def test_depeg_same_data_point_polled_twice_does_not_confirm(db_path: Path):
+    from hfwb.depeg import DepegTracker, PriceReading
+    from hfwb.runner import check_depeg_cycle
+    from hfwb.store import add_depeg_subs
+
+    add_depeg_subs(db_path, 960, ["USDC"])
+    tracker, tg = DepegTracker(), FakeTelegramClient()
+    fixed = {"USDC": PriceReading("USDC", Decimal("0.9000"), 0.99, 900)}  # one data point, polled every minute
+    for now in (1000.0, 1060.0, 1120.0):
+        check_depeg_cycle(db_path, tg_client=tg, tracker=tracker, fetcher_fn=lambda: fixed,
+                          oracle_fn=lambda s, r: None, clock=lambda n=now: n)
+    assert tg.sent_messages == []  # a glitch that lives for 5 minutes is still a single observation
+    newer = {"USDC": PriceReading("USDC", Decimal("0.9000"), 0.99, 1180)}  # next DefiLlama update confirms it
+    check_depeg_cycle(db_path, tg_client=tg, tracker=tracker, fetcher_fn=lambda: newer,
+                      oracle_fn=lambda s, r: None, clock=lambda: 1200.0)
+    assert len(tg.sent_messages) == 1

@@ -1,5 +1,6 @@
 import logging
 import sqlite3
+from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_LEGACY_MARKET_KEY = "aave_v3:42161:0x794a61358d6845594f94dc1db02a252b5b4814ad"
 MAX_ADDRESSES_PER_CHAT = 3
 MAX_WATCHES_PER_CHAT = 30
+MAX_DEPEG_SUBS_PER_CHAT = 12
 
 
 class LimitError(Exception):
@@ -34,6 +36,14 @@ class TrackedAddress:
     chat_id: int
     address: str
     last_scan_ts: float | None
+
+
+@dataclass(frozen=True)
+class DepegSubRecord:
+    chat_id: int
+    symbol: str
+    state: str
+    last_alert_ts: float | None
 
 
 @contextmanager
@@ -132,7 +142,19 @@ def init_db(db_path: str | Path) -> None:
             """
         )
 
-        conn.execute("PRAGMA user_version = 2;")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS depeg_subs (
+                chat_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'ok',
+                last_alert_ts REAL,
+                PRIMARY KEY (chat_id, symbol)
+            );
+            """
+        )
+
+        conn.execute("PRAGMA user_version = 3;")
 
 
 def add_tracked_address(
@@ -448,7 +470,7 @@ def update_state(
 
 
 def delete_chat(db_path: str | Path, chat_id: int) -> int:
-    """Delete all watches, tracked addresses, and settings for a chat. Returns total deleted records."""
+    """Delete all watches, tracked addresses, settings, and depeg subscriptions for a chat."""
     with get_connection(db_path) as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM watches WHERE chat_id = ?", (chat_id,))
@@ -456,7 +478,9 @@ def delete_chat(db_path: str | Path, chat_id: int) -> int:
         cur.execute("DELETE FROM tracked_addresses WHERE chat_id = ?", (chat_id,))
         t_count = cur.rowcount
         cur.execute("DELETE FROM chat_settings WHERE chat_id = ?", (chat_id,))
-        return max(w_count, t_count)
+        cur.execute("DELETE FROM depeg_subs WHERE chat_id = ?", (chat_id,))
+        d_count = cur.rowcount
+        return max(w_count, t_count, d_count)
 
 
 def get_levels(db_path: str | Path, chat_id: int) -> tuple[Decimal, ...]:
@@ -583,3 +607,131 @@ def get_table_columns(db_path: str | Path, table_name: str) -> list[str]:
         cur = conn.cursor()
         cur.execute(f"PRAGMA table_info({table_name})")
         return [row[1] for row in cur.fetchall()]
+
+
+def add_depeg_subs(
+    db_path: str | Path,
+    chat_id: int,
+    symbols: Sequence[str],
+) -> list[str]:
+    """Subscribe a chat to stablecoin depeg alerts for given symbols.
+
+    Enforces max 12 subscriptions per chat.
+    """
+    with get_connection(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT symbol FROM depeg_subs WHERE chat_id = ?", (chat_id,))
+        existing = {r[0] for r in cur.fetchall()}
+        new_symbols = [s for s in symbols if s not in existing]
+        if len(existing) + len(new_symbols) > MAX_DEPEG_SUBS_PER_CHAT:
+            raise LimitError(
+                f"Limit of {MAX_DEPEG_SUBS_PER_CHAT} stablecoin subscriptions per chat reached"
+            )
+
+        for s in symbols:
+            cur.execute(
+                """
+                INSERT INTO depeg_subs (chat_id, symbol, state, last_alert_ts)
+                VALUES (?, ?, 'ok', NULL)
+                ON CONFLICT (chat_id, symbol) DO NOTHING
+                """,
+                (chat_id, s),
+            )
+        return list(symbols)
+
+
+def remove_depeg_subs(
+    db_path: str | Path,
+    chat_id: int,
+    symbols: Sequence[str] | None = None,
+) -> int:
+    """Remove depeg subscriptions for a chat, or all if symbols is None."""
+    with get_connection(db_path) as conn:
+        cur = conn.cursor()
+        if symbols is None:
+            cur.execute("DELETE FROM depeg_subs WHERE chat_id = ?", (chat_id,))
+            return cur.rowcount
+        total = 0
+        for s in symbols:
+            cur.execute(
+                "DELETE FROM depeg_subs WHERE chat_id = ? AND symbol = ?",
+                (chat_id, s),
+            )
+            total += cur.rowcount
+        return total
+
+
+def list_depeg_subs(
+    db_path: str | Path,
+    chat_id: int,
+) -> list[DepegSubRecord]:
+    """Return all depeg subscriptions for a chat ordered by symbol."""
+    with get_connection(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT chat_id, symbol, state, last_alert_ts
+            FROM depeg_subs
+            WHERE chat_id = ?
+            ORDER BY symbol ASC
+            """,
+            (chat_id,),
+        )
+        return [
+            DepegSubRecord(
+                chat_id=r[0],
+                symbol=r[1],
+                state=r[2],
+                last_alert_ts=r[3],
+            )
+            for r in cur.fetchall()
+        ]
+
+
+def subscribers_by_symbol(
+    db_path: str | Path,
+) -> dict[str, list[tuple[int, str, float | None]]]:
+    """Return mapping of symbol to list of (chat_id, state, last_alert_ts) tuples."""
+    result: dict[str, list[tuple[int, str, float | None]]] = defaultdict(list)
+    with get_connection(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT symbol, chat_id, state, last_alert_ts
+            FROM depeg_subs
+            ORDER BY symbol ASC, chat_id ASC
+            """
+        )
+        for r in cur.fetchall():
+            result[r[0]].append((r[1], r[2], r[3]))
+    return dict(result)
+
+
+def update_depeg_state(
+    db_path: str | Path,
+    chat_id: int,
+    symbol: str,
+    state: str,
+    last_alert_ts: float | None = None,
+) -> None:
+    """Update state and optionally last_alert_ts for a depeg subscription."""
+    with get_connection(db_path) as conn:
+        cur = conn.cursor()
+        if last_alert_ts is not None:
+            cur.execute(
+                """
+                UPDATE depeg_subs
+                SET state = ?, last_alert_ts = ?
+                WHERE chat_id = ? AND symbol = ?
+                """,
+                (state, last_alert_ts, chat_id, symbol),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE depeg_subs
+                SET state = ?
+                WHERE chat_id = ? AND symbol = ?
+                """,
+                (state, chat_id, symbol),
+            )

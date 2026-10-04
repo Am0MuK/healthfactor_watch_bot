@@ -10,6 +10,7 @@ from hfwb.store import (
     LimitError,
     TrackedAddress,
     WatchRecord,
+    add_depeg_subs,
     add_tracked_address,
     add_watch,
     clear_failure,
@@ -19,14 +20,18 @@ from hfwb.store import (
     get_levels,
     get_table_columns,
     init_db,
+    list_depeg_subs,
     list_tracked_addresses,
     list_watches,
     list_watches_by_address,
     record_failure,
     remove_address,
+    remove_depeg_subs,
     remove_watch,
     reset_levels,
     set_levels,
+    subscribers_by_symbol,
+    update_depeg_state,
     update_last_scan_ts,
     update_state,
 )
@@ -82,7 +87,7 @@ def test_migration_from_old_schema(tmp_path: Path):
     conn = sqlite3.connect(str(old_db))
     cur = conn.cursor()
     cur.execute("PRAGMA user_version;")
-    assert cur.fetchone()[0] == 2
+    assert cur.fetchone()[0] == 3
 
     cur.execute("SELECT chat_id, address, market_key, state, last_alert_ts, fail_count FROM watches;")
     rows = cur.fetchall()
@@ -266,10 +271,10 @@ def test_tracked_address_rescan_ts(db_path: Path):
     assert tracked[0].last_scan_ts == 250.0
 
 
-def test_schema_user_version_2_and_chat_settings_table(db_path: Path):
+def test_schema_user_version_3_and_chat_settings_table(db_path: Path):
     with sqlite3.connect(str(db_path)) as conn:
         ver = conn.execute("PRAGMA user_version;").fetchone()[0]
-        assert ver == 2
+        assert ver == 3
 
     cols = get_table_columns(db_path, "chat_settings")
     forbidden = {"username", "user_name", "first_name", "last_name", "message", "text"}
@@ -321,7 +326,7 @@ def test_migration_from_v1_schema(tmp_path: Path):
 
     # Check upgraded version and preserved data
     conn = sqlite3.connect(str(v1_db))
-    assert conn.execute("PRAGMA user_version;").fetchone()[0] == 2
+    assert conn.execute("PRAGMA user_version;").fetchone()[0] == 3
     row = conn.execute("SELECT chat_id, address, market_key, state, last_alert_ts, fail_count FROM watches;").fetchone()
     assert row == (1001, "0x1111111111111111111111111111111111111111", "m_key_1", "L2", 54321.0, 1)
     t_row = conn.execute("SELECT chat_id, address, last_scan_ts FROM tracked_addresses;").fetchone()
@@ -410,3 +415,160 @@ def test_corrupt_stored_levels_fallback(db_path: Path, caplog):
 
     assert levels == DEFAULT_LEVELS
     assert any("corrupt" in r.getMessage().lower() or "falling back" in r.getMessage().lower() for r in caplog.records)
+
+
+def test_depeg_subs_schema(db_path: Path):
+    cols = get_table_columns(db_path, "depeg_subs")
+    forbidden = {"username", "user_name", "first_name", "last_name", "message", "text"}
+    for col in cols:
+        assert col.lower() not in forbidden
+    assert {"chat_id", "symbol", "state", "last_alert_ts"}.issubset(set(cols))
+
+
+def test_migration_v2_to_v3(tmp_path: Path):
+    v2_db = tmp_path / "v2.db"
+    conn = sqlite3.connect(str(v2_db))
+    conn.execute(
+        """
+        CREATE TABLE watches (
+            chat_id INTEGER NOT NULL,
+            address TEXT NOT NULL,
+            market_key TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'ok',
+            last_alert_ts REAL,
+            fail_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (chat_id, address, market_key)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE tracked_addresses (
+            chat_id INTEGER NOT NULL,
+            address TEXT NOT NULL,
+            last_scan_ts REAL,
+            PRIMARY KEY (chat_id, address)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE chat_settings (
+            chat_id INTEGER PRIMARY KEY,
+            levels TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute("PRAGMA user_version = 2;")
+    conn.execute(
+        "INSERT INTO watches (chat_id, address, market_key, state) VALUES (?, ?, ?, ?)",
+        (101, "0x1111111111111111111111111111111111111111", "m1", "L1"),
+    )
+    conn.execute(
+        "INSERT INTO tracked_addresses (chat_id, address, last_scan_ts) VALUES (?, ?, ?)",
+        (101, "0x1111111111111111111111111111111111111111", 500.0),
+    )
+    conn.execute(
+        "INSERT INTO chat_settings (chat_id, levels) VALUES (?, ?)",
+        (101, "1.5,1.2"),
+    )
+    conn.commit()
+    conn.close()
+
+    # Migrate by running init_db
+    init_db(v2_db)
+
+    conn = sqlite3.connect(str(v2_db))
+    cur = conn.cursor()
+    cur.execute("PRAGMA user_version;")
+    assert cur.fetchone()[0] == 3
+
+    # Check preserved rows
+    cur.execute("SELECT chat_id, state FROM watches;")
+    assert cur.fetchall() == [(101, "L1")]
+    cur.execute("SELECT chat_id, last_scan_ts FROM tracked_addresses;")
+    assert cur.fetchall() == [(101, 500.0)]
+    cur.execute("SELECT chat_id, levels FROM chat_settings;")
+    assert cur.fetchall() == [(101, "1.5,1.2")]
+
+    # Check depeg_subs table exists
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='depeg_subs';")
+    assert cur.fetchone() is not None
+    conn.close()
+
+
+def test_add_and_list_depeg_subs(db_path: Path):
+    chat_id = 999
+    add_depeg_subs(db_path, chat_id, ["USDC", "USDT"])
+    subs = list_depeg_subs(db_path, chat_id)
+    assert len(subs) == 2
+    syms = {s.symbol: (s.state, s.last_alert_ts) for s in subs}
+    assert syms == {"USDC": ("ok", None), "USDT": ("ok", None)}
+
+    # Idempotent re-add
+    add_depeg_subs(db_path, chat_id, ["USDC"])
+    subs2 = list_depeg_subs(db_path, chat_id)
+    assert len(subs2) == 2
+
+
+def test_depeg_subs_limit(db_path: Path):
+    chat_id = 888
+    twelve = [f"S{i}" for i in range(12)]
+    add_depeg_subs(db_path, chat_id, twelve)
+    assert len(list_depeg_subs(db_path, chat_id)) == 12
+
+    # Adding a 13th symbol raises LimitError
+    with pytest.raises(LimitError, match="Limit of 12"):
+        add_depeg_subs(db_path, chat_id, ["S13"])
+
+
+def test_remove_depeg_subs(db_path: Path):
+    chat_id = 777
+    add_depeg_subs(db_path, chat_id, ["USDC", "USDT", "DAI"])
+    assert len(list_depeg_subs(db_path, chat_id)) == 3
+
+    # Remove single symbol
+    remove_depeg_subs(db_path, chat_id, ["USDC"])
+    subs = list_depeg_subs(db_path, chat_id)
+    assert len(subs) == 2
+    assert {s.symbol for s in subs} == {"USDT", "DAI"}
+
+    # Remove all (symbols=None)
+    remove_depeg_subs(db_path, chat_id, None)
+    assert list_depeg_subs(db_path, chat_id) == []
+
+
+def test_subscribers_by_symbol(db_path: Path):
+    add_depeg_subs(db_path, 1, ["USDC", "USDT"])
+    add_depeg_subs(db_path, 2, ["USDC", "DAI"])
+
+    subs_map = subscribers_by_symbol(db_path)
+    assert set(subs_map.keys()) == {"USDC", "USDT", "DAI"}
+    assert subs_map["USDC"] == [(1, "ok", None), (2, "ok", None)]
+    assert subs_map["USDT"] == [(1, "ok", None)]
+    assert subs_map["DAI"] == [(2, "ok", None)]
+
+
+def test_update_depeg_state(db_path: Path):
+    chat_id = 666
+    add_depeg_subs(db_path, chat_id, ["USDC"])
+
+    update_depeg_state(db_path, chat_id, "USDC", "D1")
+    sub = list_depeg_subs(db_path, chat_id)[0]
+    assert sub.state == "D1"
+    assert sub.last_alert_ts is None
+
+    update_depeg_state(db_path, chat_id, "USDC", "D2", last_alert_ts=12345.0)
+    sub = list_depeg_subs(db_path, chat_id)[0]
+    assert sub.state == "D2"
+    assert sub.last_alert_ts == 12345.0
+
+
+def test_delete_chat_wipes_depeg_subs(db_path: Path):
+    chat_id = 555
+    add_depeg_subs(db_path, chat_id, ["USDC", "USDT"])
+    assert len(list_depeg_subs(db_path, chat_id)) == 2
+
+    delete_chat(db_path, chat_id)
+    assert list_depeg_subs(db_path, chat_id) == []
+

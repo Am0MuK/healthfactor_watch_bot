@@ -19,6 +19,7 @@ A Telegram bot that monitors Aave V3 (20 EVM chains) and Aave V4 (19 spokes acro
 - `/watch <address>` - Scan all supported markets for an Ethereum address and monitor active positions (max 3 addresses per chat).
 - `/rescan <address>` - Scan all supported markets on demand to detect new positions (rate limit: once per 5 minutes per chat).
 - `/levels [levels|reset]` - View or configure custom alert levels for this chat (e.g. `/levels 1.5 1.3 1.15 1.05` or `/levels reset`).
+- `/depeg [on|off [symbols...]]` - View status or configure opt-in stablecoin depeg alerts (e.g. `/depeg on` for all 12 tokens, `/depeg on USDC USDT`, or `/depeg off`).
 - `/list` - Display all monitored addresses grouped with their active market positions and alert states.
 - `/remove <address>` - Stop monitoring an address and all its market positions.
 - `/privacy` - View privacy notice and data retention terms.
@@ -128,6 +129,60 @@ When alert levels are changed or reset with `/levels`, all current watch states 
 - **No debt**: When an account has no debt (health factor sentinel `2^256 - 1`), it is mapped to `ok` (with a recovery notification if previously non-ok).
 - **RPC failures**: On RPC node failures, the previous known state is preserved. An internal failure counter increments per `(market, address)` pair; after 3 consecutive failures an error is recorded in server logs without user-facing spam.
 
+## Stablecoin Depeg Alerts
+
+The bot provides optional, opt-in alerts for 12 major stablecoins when their price deviates from 1.00 USD (either above or below peg). This feature is disabled by default.
+
+### Supported Stablecoins (Ethereum)
+
+- **USDC**: `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48`
+- **USDT**: `0xdAC17F958D2ee523a2206206994597C13D831ec7`
+- **DAI**: `0x6B175474E89094C44Da98b954EedeAC495271d0F`
+- **USDS**: `0xdC035D45d973E3EC169d2276DDab16f1e407384F`
+- **GHO**: `0x40D16FC0246aD3160Ccc09B8D0D3A2cD28aE6C2f`
+- **USDe**: `0x4c9EDD5852cd905f086C759E8383e09bff1E68B3`
+- **PYUSD**: `0x6c3ea9036406852006290770BEdFcAbA0e23A0e8`
+- **RLUSD**: `0x8292Bb45bf1Ee4d140127049757C2E0fF06317eD`
+- **USDG**: `0xe343167631d89B6Ffc58B88d6b7fB0228795491D`
+- **frxUSD**: `0xCAcd6fd266aF91b8AeD52aCCc382b4e165586E29`
+- **crvUSD**: `0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E`
+- **FDUSD**: `0xc5f0f7b66764F6ec8C8Dff7BA683102295E16409`
+
+### Alert Thresholds and Rules
+
+Alert levels are defined by absolute price deviation from $1.00:
+
+| Emoji | Level | Deviation Threshold | Action |
+|---|---|---|---|
+| 🟡 | D1 | 0.5% ($0.9950 or $1.0050) | Alert once on crossing |
+| 🟠 | D2 | 1.0% ($0.9900 or $1.0100) | Alert once on crossing |
+| 🔴 | D3 | 2.0% ($0.9800 or $1.0200) | Critical alert; repeats every 60 min |
+| 🚨 | D4 | 5.0% ($0.9500 or $1.0500) | Severe danger alert; repeats every 60 min |
+| 🟢 | recovery | < 0.3% ($0.9970 to $1.0030) | Recovery notification when back within 0.3% |
+
+- **Escalation confirmation**: Moving to a higher severity level requires two different price data points in a row (not the same data point polled twice) at or above that level. The confirmed deviation is the lower of the two, so a single glitchy print never alerts and a fast collapse (for example 1% then 3% then 7%) still alerts at every step, one data point behind the price.
+- **Hysteresis and step-down**: Moving down from level $D_k$ to $D_{k-1}$ requires the deviation to drop below $0.8 \times \text{threshold}_k$ (e.g. leaving D4 for D3 requires deviation < 4.0%; D3 to D2 < 1.6%; D2 to D1 < 0.8%). Step-downs occur immediately and do not generate alert messages.
+- **Recovery**: Returning to normal (`ok`) occurs immediately once the price deviation drops below 0.3%.
+- **Price above peg**: Deviations above peg are tracked identically to deviations below peg.
+
+### Commands
+
+- `/depeg` - View current subscription status and tracked token states.
+- `/depeg on` - Subscribe to alerts for all 12 supported stablecoins.
+- `/depeg on <symbols>` - Subscribe to specific stablecoins (case-insensitive, separated by spaces or commas, e.g. `/depeg on USDC USDT` or `/depeg on usds,pyusd`).
+- `/depeg off` - Turn off all stablecoin depeg alerts for this chat.
+- `/depeg off <symbols>` - Unsubscribe from specific stablecoins.
+
+### Data Source and Limitations
+
+- **Aggregated Market Price**: Prices come from DefiLlama (`coins.llama.fi`), which is polled every 60 seconds. It is an aggregated market price and can differ across exchanges, liquidity pools, and chains.
+- **Delay**: DefiLlama refreshes each token about every 5 minutes, and some tokens are normally 11 to 15 minutes old. With the two-data-point confirmation, expect an alert roughly 5 to 15 minutes after a move shows up in the data. This is a slow-moving depeg warning, not a real-time trading signal.
+- **Canonical Ethereum Addresses**: Only canonical Ethereum contract addresses are polled; bridged or wrapped representations on L2s and alt-L1s may trade at slightly different values.
+- **Confidence and Staleness**: A price reading is only considered usable if DefiLlama reports confidence $\ge 0.9$ and the timestamp is not older than 20 minutes. If a token's data is stale or unavailable, no state change or alert happens for it that cycle, and an entirely empty response from the source is treated as an error (logged), never as "no depeg".
+- **Aave Oracle Price**: When an alert is dispatched, the bot queries the Ethereum Aave Oracle contract (`0x54586bE62E3c3580375aE3723C145253060Ca0C2`) on a best-effort basis for informational context.
+- **Oracle Blind Spots**: The Ethereum Aave Oracle hardcodes GHO to 1.0 USD and proxies USDe to USDT's price feed; alerts for GHO and USDe display `Aave oracle: not independent (fixed or proxy price)` instead of a numeric price.
+- **Yield-bearing Tokens Excluded**: Yield-bearing assets (e.g. sUSDe, sDAI) are not pegged to $1.00 USD and are out of scope.
+
 ## Polling Intervals and Backoff
 
 Positions are polled every 1 to 5 minutes depending on how close the position is to a level:
@@ -167,7 +222,7 @@ A background worker checks tracked addresses once every 24 hours. When an addres
 
 ## Privacy
 
-- The database stores only `chat_id`, monitored `address`, `market_key`, alert `state`, `last_alert_ts`, `fail_count`, and `last_scan_ts`.
+- The database stores only `chat_id`, monitored `address`, `market_key`, alert `state`, `last_alert_ts`, `fail_count`, `last_scan_ts`, and subscribed stablecoin symbols.
 - No user names, handles, or message contents are recorded.
 - Retention is strictly "until `/remove` or `/delete`".
 - If Telegram reports HTTP 403 ("bot was blocked by the user"), all rows for that chat are automatically deleted.

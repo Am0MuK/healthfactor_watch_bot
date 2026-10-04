@@ -445,3 +445,83 @@ def test_list_uses_chat_levels(db_path: Path):
     res = handler.handle({"message": {"chat": {"id": 123}, "text": "/list"}})
     assert len(res) == 1
     assert res[0][1].strip().endswith("Levels: 1.8 / 1.4")
+
+
+def test_depeg_status_command(db_path: Path):
+    handler = BotHandler(db_path, markets=[M_ARB])
+    res = handler.handle({"message": {"chat": {"id": 123}, "text": "/depeg"}})
+    assert len(res) == 1
+    assert "off" in res[0][1].lower()
+
+
+def test_depeg_on_all_and_status(db_path: Path):
+    from hfwb.store import list_depeg_subs
+    handler = BotHandler(db_path, markets=[M_ARB])
+    res = handler.handle({"message": {"chat": {"id": 123}, "text": "/depeg on"}})
+    assert len(res) == 1
+    assert "Subscribed to stablecoin depeg alerts" in res[0][1]
+
+    subs = list_depeg_subs(db_path, 123)
+    assert len(subs) == 12
+
+    # /depeg now shows status with active symbols
+    status_res = handler.handle({"message": {"chat": {"id": 123}, "text": "/depeg"}})
+    assert "USDC" in status_res[0][1]
+    assert "USDT" in status_res[0][1]
+
+
+def test_depeg_on_specific_symbols(db_path: Path):
+    from hfwb.store import list_depeg_subs
+    handler = BotHandler(db_path, markets=[M_ARB])
+    # Case-insensitive with comma and spaces
+    res = handler.handle({"message": {"chat": {"id": 123}, "text": "/depeg on usdc,  usdt"}})
+    assert len(res) == 1
+    assert "USDC, USDT" in res[0][1]
+
+    subs = list_depeg_subs(db_path, 123)
+    assert len(subs) == 2
+    assert {s.symbol for s in subs} == {"USDC", "USDT"}
+
+
+def test_depeg_on_unknown_symbol(db_path: Path):
+    from hfwb.store import list_depeg_subs
+    handler = BotHandler(db_path, markets=[M_ARB])
+    res = handler.handle({"message": {"chat": {"id": 123}, "text": "/depeg on USDC FOO"}})
+    assert len(res) == 1
+    assert "Invalid stablecoin symbol" in res[0][1]
+    assert "FOO" in res[0][1]
+    assert "USDC" in res[0][1]  # Supported symbols listed
+
+    # Nothing saved
+    subs = list_depeg_subs(db_path, 123)
+    assert len(subs) == 0
+
+
+def test_depeg_off_commands(db_path: Path):
+    from hfwb.store import list_depeg_subs
+    handler = BotHandler(db_path, markets=[M_ARB])
+    handler.handle({"message": {"chat": {"id": 123}, "text": "/depeg on USDC USDT DAI"}})
+    assert len(list_depeg_subs(db_path, 123)) == 3
+
+    # Remove one
+    res_off_one = handler.handle({"message": {"chat": {"id": 123}, "text": "/depeg off usdc"}})
+    assert "Removed stablecoin depeg alerts for <b>USDC</b>" in res_off_one[0][1]
+    subs = list_depeg_subs(db_path, 123)
+    assert len(subs) == 2
+    assert {s.symbol for s in subs} == {"USDT", "DAI"}
+
+    # Remove all
+    res_off_all = handler.handle({"message": {"chat": {"id": 123}, "text": "/depeg off"}})
+    assert "turned <b>off</b> for all tokens" in res_off_all[0][1]
+    assert len(list_depeg_subs(db_path, 123)) == 0
+
+
+def test_depeg_delete_wipes_subs(db_path: Path):
+    from hfwb.store import list_depeg_subs
+    handler = BotHandler(db_path, markets=[M_ARB])
+    handler.handle({"message": {"chat": {"id": 123}, "text": "/depeg on USDC"}})
+    assert len(list_depeg_subs(db_path, 123)) == 1
+
+    handler.handle({"message": {"chat": {"id": 123}, "text": "/delete"}})
+    assert len(list_depeg_subs(db_path, 123)) == 0
+

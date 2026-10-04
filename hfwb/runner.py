@@ -12,7 +12,16 @@ from typing import Any
 
 from hfwb.aave import AccountData, ReadError, read_market
 from hfwb.bot import BotHandler
-from hfwb.format import format_alert, format_new_position
+from hfwb.depeg import (
+    DepegTracker,
+    PriceError,
+    PriceReading,
+    depeg_step,
+    deviation,
+    fetch_prices,
+    oracle_price,
+)
+from hfwb.format import format_alert, format_depeg_alert, format_new_position
 from hfwb.markets import Market, get_market, load_markets
 from hfwb.scan import scan_address
 from hfwb.schedule import INTERVAL_FAR, backoff_for, combine, poll_interval_for
@@ -28,6 +37,8 @@ from hfwb.store import (
     list_watches,
     list_watches_by_address,
     record_failure,
+    subscribers_by_symbol,
+    update_depeg_state,
     update_last_scan_ts,
     update_state,
 )
@@ -40,6 +51,7 @@ DEFAULT_PER_HOST_CAP = 3
 DEFAULT_POLL_INTERVAL = 300.0  # seconds (deprecated, kept for backwards compatibility)
 DEFAULT_TICK_SECONDS = 15.0  # seconds
 DEFAULT_RESCAN_INTERVAL = 86400.0  # 24 hours
+DEFAULT_DEPEG_TICK_SECONDS = 60.0  # seconds
 
 
 class PollScheduler:
@@ -490,6 +502,150 @@ def run_command_loop(
     logger.info("Command loop stopped")
 
 
+class DepegLoopState:
+    """Tracks failure streaks and rate-limited error logging for the depeg loop."""
+
+    def __init__(self) -> None:
+        self.consecutive_failures: int = 0
+        self.last_error_log_ts: float = 0.0
+
+    def record_failure(self, exc: Exception, now: float) -> None:
+        self.consecutive_failures += 1
+        logger.warning("Price fetch failed: %s", exc)
+        if self.consecutive_failures >= 5 and (
+            self.last_error_log_ts == 0.0 or (now - self.last_error_log_ts) >= 1800.0
+        ):
+            logger.error(
+                "Depeg price fetch failed %d consecutive times: %s",
+                self.consecutive_failures,
+                exc,
+            )
+            self.last_error_log_ts = now
+
+    def record_success(self) -> None:
+        self.consecutive_failures = 0
+
+
+def check_depeg_cycle(
+    db_path: str | Path,
+    tg_client: Any,
+    tracker: DepegTracker,
+    fetcher_fn: Callable[..., dict[str, PriceReading]] = fetch_prices,
+    oracle_fn: Callable[..., Decimal | None] = oracle_price,
+    clock: Callable[[], float] = time.time,
+    ethereum_rpcs: Sequence[str] | None = None,
+    error_state: DepegLoopState | None = None,
+) -> None:
+    """Execute a single depeg monitoring check cycle."""
+    subs = subscribers_by_symbol(db_path)
+    if not subs:
+        return
+
+    now = clock()
+    try:
+        readings = fetcher_fn()
+        if error_state is not None:
+            error_state.record_success()
+    except PriceError as exc:
+        tracker.reset()  # after an outage the next reading is a first reading again
+        if error_state is not None:
+            error_state.record_failure(exc, now)
+        else:
+            logger.warning("Price fetch failed: %s", exc)
+        return
+    except Exception as exc:  # noqa: BLE001 - unexpected fetcher error
+        tracker.reset()
+        if error_state is not None:
+            error_state.record_failure(exc, now)
+        else:
+            logger.warning("Unexpected error fetching prices: %s", exc)
+        return
+
+    if ethereum_rpcs is None:
+        m = get_market("aave_v3:1:0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2")
+        rpcs: Sequence[str] = m.rpcs if m else ()
+    else:
+        rpcs = ethereum_rpcs
+
+    oracle_cache: dict[str, Decimal | None] = {}
+
+    for symbol, chat_records in subs.items():
+        if symbol not in readings:
+            tracker.forget(symbol)
+            continue
+
+        reading = readings[symbol]
+        dev = deviation(reading.price)
+
+        escalate_dev, confirmed = tracker.observe(symbol, dev, reading.timestamp)
+
+        for chat_id, prev_state, last_alert_ts in chat_records:
+            new_state, alert = depeg_step(
+                prev_state=prev_state,
+                dev=dev,
+                now_ts=now,
+                last_alert_ts=last_alert_ts,
+                confirmed=confirmed,
+                escalate_dev=escalate_dev,
+            )
+            if alert is not None:
+                if symbol not in oracle_cache:
+                    oracle_cache[symbol] = oracle_fn(symbol, rpcs)
+                o_price = oracle_cache[symbol]
+                age_s = now - reading.timestamp
+                alert_text = format_depeg_alert(
+                    alert_type=alert,
+                    symbol=symbol,
+                    price=reading.price,
+                    readings_age_s=age_s,
+                    oracle_price=o_price,
+                )
+                try:
+                    tg_client.send_message(chat_id, alert_text)
+                    update_depeg_state(db_path, chat_id, symbol, new_state, last_alert_ts=now)
+                except Blocked:
+                    logger.info("Bot blocked by user %s during depeg alert; deleting chat", chat_id)
+                    delete_chat(db_path, chat_id)
+                except TelegramError as exc:
+                    logger.warning("Failed to send depeg alert to %s: %s", chat_id, exc)
+            elif new_state != prev_state:
+                update_depeg_state(db_path, chat_id, symbol, new_state)
+
+
+def run_depeg_loop(
+    stop_event: threading.Event,
+    db_path: str | Path,
+    tg_client: Any,
+    fetcher_fn: Callable[..., dict[str, PriceReading]] = fetch_prices,
+    oracle_fn: Callable[..., Decimal | None] = oracle_price,
+    clock: Callable[[], float] = time.time,
+    tick_seconds: float = DEFAULT_DEPEG_TICK_SECONDS,
+    tracker: DepegTracker | None = None,
+    ethereum_rpcs: Sequence[str] | None = None,
+) -> None:
+    """Run recurring depeg monitoring loop ticking every tick_seconds until stop_event is set."""
+    if tracker is None:
+        tracker = DepegTracker()
+    state = DepegLoopState()
+    logger.info("Starting depeg loop (tick=%.1fs)", tick_seconds)
+    while not stop_event.is_set():
+        try:
+            check_depeg_cycle(
+                db_path=db_path,
+                tg_client=tg_client,
+                tracker=tracker,
+                fetcher_fn=fetcher_fn,
+                oracle_fn=oracle_fn,
+                clock=clock,
+                ethereum_rpcs=ethereum_rpcs,
+                error_state=state,
+            )
+        except Exception:
+            logger.exception("Unhandled error in depeg loop cycle")
+        stop_event.wait(tick_seconds)
+    logger.info("Depeg loop stopped")
+
+
 def run_all(
     db_path: str | Path,
     tg_client: TelegramClient,
@@ -500,7 +656,7 @@ def run_all(
     poll_interval: float | None = None,
     poll_timeout: int = 50,
 ) -> None:
-    """Run poll loop, daily rescan loop, and command loop with graceful shutdown."""
+    """Run poll loop, daily rescan loop, depeg loop, and command loop with graceful shutdown."""
     stop_event = threading.Event()
 
     def _sig_handler(signum: int, frame: Any) -> None:
@@ -543,6 +699,17 @@ def run_all(
     )
     rescan_thread.start()
 
+    depeg_thread = threading.Thread(
+        target=run_depeg_loop,
+        kwargs={
+            "stop_event": stop_event,
+            "db_path": db_path,
+            "tg_client": tg_client,
+        },
+        daemon=True,
+    )
+    depeg_thread.start()
+
     try:
         run_command_loop(
             stop_event=stop_event,
@@ -554,4 +721,5 @@ def run_all(
         stop_event.set()
         poll_thread.join(timeout=10.0)
         rescan_thread.join(timeout=5.0)
+        depeg_thread.join(timeout=5.0)
         logger.info("Shutdown complete")

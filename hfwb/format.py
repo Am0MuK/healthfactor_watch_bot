@@ -3,9 +3,11 @@ from collections.abc import Sequence
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
+from hfwb.depeg import ORACLE_NOT_INDEPENDENT
 from hfwb.state import DEFAULT_LEVELS, LEVELS
 
 FOOTER = "<i>Informational only, not financial advice.</i>"
+DEPEG_FOOTER = "<i>Aggregated market price; it can differ between exchanges and chains. Informational only, not financial advice.</i>"
 
 LEVEL_THRESHOLDS: dict[str, str] = {
     f"L{i + 1}": str(thresh) for i, thresh in enumerate(LEVELS)
@@ -203,6 +205,7 @@ def format_start() -> str:
         "/watch &lt;address&gt; - Scan all markets and watch active positions (max 3 addresses per chat)\n"
         "/rescan &lt;address&gt; - Rescan all markets for an address (max once per 5 min)\n"
         "/levels [levels|reset] - View or set custom alert levels per chat\n"
+        "/depeg [on|off] - Configure stablecoin depeg alerts (default off)\n"
         "/list - List monitored addresses and positions\n"
         "/remove &lt;address&gt; - Stop watching an address\n"
         "/privacy - View privacy information\n"
@@ -218,7 +221,8 @@ def format_help() -> str:
 def format_privacy() -> str:
     return (
         "Privacy Notice:\n\n"
-        "This bot stores chat_id, wallet address, market list, and alert state only.\n"
+        "This bot stores chat_id, wallet address, market list, and alert state only "
+        "(plus subscribed token symbols for stablecoin depeg alerts).\n"
         "No names, usernames, or message text are stored.\n"
         "Wallet addresses are public on chain but personal data under GDPR. "
         "Retention is until /remove or /delete, plus auto-removal if the bot is blocked.\n"
@@ -450,3 +454,136 @@ def format_rescan_rate_limit() -> str:
 
 def format_unknown() -> str:
     return "Unknown command. Use /help to see available commands."
+
+
+def format_depeg_alert(
+    alert_type: str,
+    symbol: str,
+    price: Decimal,
+    readings_age_s: float,
+    oracle_price: Decimal | None = None,
+) -> str:
+    """Format stablecoin depeg alert in HTML."""
+    emoji_map = {
+        "D1": "🟡",
+        "D2": "🟠",
+        "D3": "🔴",
+        "D4": "🚨",
+        "repeat_D3": "🔴",
+        "repeat_D4": "🚨",
+        "recovery": "🟢",
+    }
+    emoji = emoji_map.get(alert_type, "🟡")
+    esc_symbol = html.escape(symbol)
+
+    lines = [f"{emoji} <b>{esc_symbol} price alert</b>"]
+
+    pct = abs(price - Decimal(1)) * 100
+    direction = "below" if price < Decimal(1) else "above"
+    lines.append(f"Price <b>${price:.4f}</b> ({pct:.2f}% {direction} $1.00)")
+
+    verb = "Fell" if price < Decimal(1) else "Rose"
+    if alert_type == "D1":
+        lines.append(f"{verb} past <b>0.5%</b> from the peg")
+    elif alert_type == "D2":
+        lines.append(f"{verb} past <b>1%</b> from the peg")
+    elif alert_type == "D3":
+        lines.append(f"{verb} past <b>2%</b> from the peg")
+    elif alert_type == "D4":
+        lines.append(f"{verb} past <b>5%</b> from the peg")
+    elif alert_type == "repeat_D3":
+        lines.append("Still more than 2% from the peg")
+    elif alert_type == "repeat_D4":
+        lines.append("Still more than 5% from the peg")
+    elif alert_type == "recovery":
+        lines.append("Back within 0.3% of $1.00")
+    else:
+        lines.append(f"Status: <b>{html.escape(alert_type)}</b>")
+
+    age_m = int(readings_age_s // 60)
+    if age_m <= 0:
+        age_str = "just now"
+    elif age_m == 1:
+        age_str = "1 min ago"
+    else:
+        age_str = f"{age_m} min ago"
+    lines.append(f"Market price (DefiLlama), updated {age_str}")
+
+    if symbol in ORACLE_NOT_INDEPENDENT:
+        lines.append("Aave oracle: not independent (fixed or proxy price)")
+    elif oracle_price is not None:
+        lines.append(f"Aave oracle: ${oracle_price:.4f}")
+
+    if alert_type in ("D3", "D4", "repeat_D3", "repeat_D4"):
+        lines.append("<b>Large move</b>")
+
+    lines.append("")
+    lines.append(DEPEG_FOOTER)
+    return "\n".join(lines)
+
+
+def format_depeg_status(
+    subs: Sequence[Any],
+    readings: dict[str, Any] | None = None,
+) -> str:
+    """Format status of stablecoin depeg alert subscriptions."""
+    if not subs:
+        return (
+            "Stablecoin depeg alerts are currently <b>off</b>.\n\n"
+            "Use <code>/depeg on</code> to subscribe to all supported stablecoins, "
+            "or <code>/depeg on &lt;symbols&gt;</code> to choose specific tokens."
+        )
+
+    lines = ["<b>Stablecoin depeg alerts</b>\n\nSubscribed tokens:"]
+    emoji_map = {
+        "ok": "🟢",
+        "D1": "🟡",
+        "D2": "🟠",
+        "D3": "🔴",
+        "D4": "🚨",
+    }
+    for sub in subs:
+        sym = getattr(sub, "symbol", None) or (sub[0] if isinstance(sub, (list, tuple)) else str(sub))
+        st = getattr(sub, "state", None) or (sub[1] if isinstance(sub, (list, tuple)) and len(sub) > 1 else "ok")
+        emoji = emoji_map.get(st, "🟢")
+        esc_sym = html.escape(str(sym))
+        esc_st = html.escape(str(st))
+        line = f"{emoji} <b>{esc_sym}</b> ({esc_st})"
+        if readings and sym in readings:
+            r = readings[sym]
+            price_val = getattr(r, "price", r)
+            line += f"  ${price_val:.4f}"
+        lines.append(line)
+
+    lines.extend([
+        "",
+        "Use <code>/depeg on [symbols]</code> or <code>/depeg off [symbols]</code> to modify.",
+        "",
+        DEPEG_FOOTER,
+    ])
+    return "\n".join(lines)
+
+
+def format_depeg_on(symbols: Sequence[str]) -> str:
+    """Format confirmation message after enabling depeg alerts."""
+    esc = ", ".join(html.escape(s) for s in symbols)
+    return (
+        f"Subscribed to stablecoin depeg alerts for <b>{esc}</b>.\n\n"
+        "Alerts trigger when price deviates by 0.5% or more from $1.00.\n\n"
+        f"{DEPEG_FOOTER}"
+    )
+
+
+def format_depeg_off(symbols: Sequence[str] | None = None) -> str:
+    """Format confirmation message after disabling depeg alerts."""
+    if not symbols:
+        return "Stablecoin depeg alerts turned <b>off</b> for all tokens."
+    esc = ", ".join(html.escape(s) for s in symbols)
+    return f"Removed stablecoin depeg alerts for <b>{esc}</b>."
+
+
+def format_depeg_error(msg: str, supported: Sequence[str]) -> str:
+    """Format error message for invalid depeg command input."""
+    esc_msg = html.escape(msg)
+    esc_sup = ", ".join(html.escape(s) for s in supported)
+    return f"Invalid stablecoin symbol: <b>{esc_msg}</b>\n\nSupported stablecoins: {esc_sup}"
