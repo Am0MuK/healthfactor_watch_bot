@@ -23,6 +23,10 @@ from hfwb.format import (
     format_market_name,
     format_positions_limit,
     format_privacy,
+    format_pro_cleared,
+    format_pro_error,
+    format_pro_info,
+    format_pro_saved,
     format_rate_limit,
     format_remove,
     format_rescan_rate_limit,
@@ -35,12 +39,15 @@ from hfwb.markets import Market, get_market, load_markets
 from hfwb.scan import ScanResult, scan_address
 from hfwb.state import DEFAULT_LEVELS, step, validate_levels
 from hfwb.store import (
+    PRO_FEATURES,
     LimitError,
     add_depeg_subs,
     add_tracked_address,
     add_watch,
+    clear_pro_interest,
     delete_chat,
     get_levels,
+    get_pro_interest,
     list_depeg_subs,
     list_tracked_addresses,
     list_watches,
@@ -48,6 +55,7 @@ from hfwb.store import (
     remove_depeg_subs,
     reset_levels,
     set_levels,
+    set_pro_interest,
     update_last_scan_ts,
 )
 
@@ -189,6 +197,40 @@ class BotHandler:
                 return [(chat_id, format_depeg_off(valid_symbols))]
 
             return [(chat_id, format_depeg_error(raw_tokens[0], list(STABLES.keys())))]
+
+        if cmd == "/pro":
+            arg_str = text[len(tokens[0]):].strip()
+            if not arg_str:
+                current = get_pro_interest(self.db_path, chat_id)
+                return [(chat_id, format_pro_info(current))]
+
+            raw_tokens = [tok for tok in re.split(r"[\s,]+", arg_str) if tok]
+            sub_cmd = raw_tokens[0].lower()
+
+            if sub_cmd == "no":
+                clear_pro_interest(self.db_path, chat_id)
+                return [(chat_id, format_pro_cleared())]
+
+            if sub_cmd == "yes":
+                feature_tokens = raw_tokens[1:]
+                if not feature_tokens:
+                    now = self.clock()
+                    set_pro_interest(self.db_path, chat_id, [], now)
+                    return [(chat_id, format_pro_saved([]))]
+
+                valid_features: list[str] = []
+                for f in feature_tokens:
+                    f_clean = f.strip().lower()
+                    if f_clean not in PRO_FEATURES:
+                        return [(chat_id, format_pro_error(f))]
+                    if f_clean not in valid_features:
+                        valid_features.append(f_clean)
+
+                now = self.clock()
+                set_pro_interest(self.db_path, chat_id, valid_features, now)
+                return [(chat_id, format_pro_saved(valid_features))]
+
+            return [(chat_id, format_pro_error(raw_tokens[0]))]
 
         if cmd == "/list":
             chat_levels = get_levels(self.db_path, chat_id)

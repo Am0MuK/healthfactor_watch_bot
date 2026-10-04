@@ -1,14 +1,15 @@
 import argparse
 import logging
 import sys
+from pathlib import Path
 
 import httpx
 
 from hfwb.aave import read_market
-from hfwb.config import ConfigError, load_config
+from hfwb.config import ConfigError, get_db_path, load_config
 from hfwb.markets import load_markets
 from hfwb.runner import run_all
-from hfwb.store import init_db
+from hfwb.store import PRO_FEATURES, get_stats, init_db
 from hfwb.telegram import TelegramClient, TelegramError
 
 logger = logging.getLogger("hfwb")
@@ -42,6 +43,21 @@ def verify_markets() -> int:
     return 1 if failed_count > 0 else 0
 
 
+def print_stats(db_path: Path | str) -> int:
+    """Print anonymous usage and interest statistics from the database only."""
+    stats = get_stats(db_path)
+    pro = stats["pro_interest"]
+    print(f"Chats with tracked addresses: {stats['chats_with_tracked_addresses']}")
+    print(f"Watches: {stats['watches']}")
+    print(f"Depeg alerts: {stats['depeg_subs']}")
+    print(f"Custom levels chats: {stats['custom_levels_chats']}")
+    print("Pro interest:")
+    print(f"  total: {pro['total']}")
+    for f in PRO_FEATURES:
+        print(f"  {f}: {pro.get(f, 0)}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Main entrypoint for healthfactor_watch_bot."""
     parser = argparse.ArgumentParser(description="DeFi Health Alert Telegram Watch Bot")
@@ -55,7 +71,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Live test eth_call on dead address for all markets; exit 1 if any fails",
     )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Print database statistics and exit",
+    )
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+
+    if args.stats:
+        db_path = get_db_path()
+        try:
+            return print_stats(db_path)
+        except FileNotFoundError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
     if args.verify_markets:
         return verify_markets()

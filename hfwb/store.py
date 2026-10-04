@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 from hfwb.state import DEFAULT_LEVELS, validate_levels
 
@@ -15,6 +16,7 @@ DEFAULT_LEGACY_MARKET_KEY = "aave_v3:42161:0x794a61358d6845594f94dc1db02a252b5b4
 MAX_ADDRESSES_PER_CHAT = 3
 MAX_WATCHES_PER_CHAT = 30
 MAX_DEPEG_SUBS_PER_CHAT = 12
+PRO_FEATURES = ("addresses", "faster", "levels", "email", "discord")
 
 
 class LimitError(Exception):
@@ -154,7 +156,17 @@ def init_db(db_path: str | Path) -> None:
             """
         )
 
-        conn.execute("PRAGMA user_version = 3;")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pro_interest (
+                chat_id INTEGER PRIMARY KEY,
+                features TEXT NOT NULL,
+                created_ts REAL NOT NULL
+            );
+            """
+        )
+
+        conn.execute("PRAGMA user_version = 4;")
 
 
 def add_tracked_address(
@@ -470,7 +482,7 @@ def update_state(
 
 
 def delete_chat(db_path: str | Path, chat_id: int) -> int:
-    """Delete all watches, tracked addresses, settings, and depeg subscriptions for a chat."""
+    """Delete all watches, tracked addresses, settings, depeg subscriptions, and pro interest for a chat."""
     with get_connection(db_path) as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM watches WHERE chat_id = ?", (chat_id,))
@@ -480,7 +492,9 @@ def delete_chat(db_path: str | Path, chat_id: int) -> int:
         cur.execute("DELETE FROM chat_settings WHERE chat_id = ?", (chat_id,))
         cur.execute("DELETE FROM depeg_subs WHERE chat_id = ?", (chat_id,))
         d_count = cur.rowcount
-        return max(w_count, t_count, d_count)
+        cur.execute("DELETE FROM pro_interest WHERE chat_id = ?", (chat_id,))
+        p_count = cur.rowcount
+        return max(w_count, t_count, d_count, p_count)
 
 
 def get_levels(db_path: str | Path, chat_id: int) -> tuple[Decimal, ...]:
@@ -735,3 +749,132 @@ def update_depeg_state(
                 """,
                 (state, chat_id, symbol),
             )
+
+
+def set_pro_interest(
+    db_path: str | Path,
+    chat_id: int,
+    features: Sequence[str],
+    now: float,
+) -> None:
+    """Upsert a chat's pro feature interest. Empty list stores 'any'."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for f in features:
+        f_norm = f.strip().lower()
+        if f_norm and f_norm not in seen and f_norm != "any":
+            seen.add(f_norm)
+            cleaned.append(f_norm)
+    features_str = ",".join(cleaned) if cleaned else "any"
+    with get_connection(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO pro_interest (chat_id, features, created_ts)
+            VALUES (?, ?, ?)
+            ON CONFLICT (chat_id) DO UPDATE SET
+                features = excluded.features,
+                created_ts = excluded.created_ts
+            """,
+            (chat_id, features_str, now),
+        )
+
+
+def clear_pro_interest(db_path: str | Path, chat_id: int) -> bool:
+    """Remove pro interest for a chat."""
+    with get_connection(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM pro_interest WHERE chat_id = ?", (chat_id,))
+        return cur.rowcount > 0
+
+
+def get_pro_interest(db_path: str | Path, chat_id: int) -> tuple[str, ...] | None:
+    """Return pro interest tuple for a chat, or None if not set.
+
+    Corrupt stored features fall back to ('any',) without crashing.
+    """
+    with get_connection(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT features FROM pro_interest WHERE chat_id = ?", (chat_id,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        raw = row[0]
+        if raw == "any":
+            return ("any",)
+        tokens = [t.strip() for t in raw.split(",") if t.strip()]
+        if all(t in PRO_FEATURES for t in tokens) and tokens:
+            return tuple(tokens)
+        logger.warning(
+            "Corrupt pro_interest features for chat %s: '%s'. Falling back to 'any'.",
+            chat_id,
+            raw,
+        )
+        return ("any",)
+
+
+def _count_pro_rows(rows: list[tuple[str]]) -> dict[str, int]:
+    counts = {"total": 0, **{f: 0 for f in PRO_FEATURES}}
+    for (raw_features,) in rows:
+        counts["total"] += 1
+        if raw_features == "any":
+            continue
+        tokens = [t.strip() for t in raw_features.split(",") if t.strip()]
+        if tokens and all(t in PRO_FEATURES for t in tokens):
+            for t in set(tokens):
+                counts[t] += 1
+        else:
+            logger.warning(
+                "Corrupt pro_interest features: '%s'. Counting in total only.",
+                raw_features,
+            )
+    return counts
+
+
+def pro_interest_counts(db_path: str | Path) -> dict[str, int]:
+    """Return interest counts: 'total' and one count per feature.
+
+    A chat that chose 'any' (or corrupt stored features) counts in 'total' only.
+    """
+    with get_connection(db_path) as conn:
+        rows = conn.execute("SELECT features FROM pro_interest").fetchall()
+    return _count_pro_rows(rows)
+
+
+def get_stats(db_path: str | Path) -> dict[str, Any]:
+    """Return database-only stats for --stats reporting.
+
+    Strictly read-only: the file is opened with mode=ro, nothing is created or migrated, and a table that
+    an older schema does not have yet counts as zero. Raises FileNotFoundError when the file is missing.
+    """
+    path = Path(db_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"database not found: {path}")
+
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30.0)
+    try:
+
+        def count(sql: str) -> int:
+            try:
+                return int(conn.execute(sql).fetchone()[0])
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc):
+                    return 0
+                raise
+
+        try:
+            pro_rows = conn.execute("SELECT features FROM pro_interest").fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                raise
+            pro_rows = []
+
+        return {
+            "chats_with_tracked_addresses": count("SELECT COUNT(DISTINCT chat_id) FROM tracked_addresses"),
+            "watches": count("SELECT COUNT(*) FROM watches"),
+            "depeg_subs": count("SELECT COUNT(*) FROM depeg_subs"),
+            "custom_levels_chats": count("SELECT COUNT(*) FROM chat_settings"),
+            "pro_interest": _count_pro_rows(pro_rows),
+        }
+    finally:
+        conn.close()

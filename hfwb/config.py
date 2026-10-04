@@ -40,6 +40,19 @@ def _parse_env_file(path: Path) -> dict[str, str]:
     return res
 
 
+def get_db_path(env_file: Path | str | None = None) -> Path:
+    """Resolve database path from environment and env-file without requiring credentials."""
+    if env_file is not None:
+        target_path = Path(env_file)
+    else:
+        target_path = Path(os.environ.get("HFWB_ENV_FILE", DEFAULT_ENV_FILE))
+
+    file_vars = _parse_env_file(target_path)
+    merged_env = {**file_vars, **os.environ}
+    db_str = merged_env.get("HFWB_DB", DEFAULT_DB_PATH).strip()
+    return Path(db_str)
+
+
 def load_config(env_file: Path | str | None = None) -> Config:
     """Load configuration from environment file and environment variables."""
     if env_file is not None:

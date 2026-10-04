@@ -142,3 +142,138 @@ def test_cli_verify_markets_flag_failure(monkeypatch, capsys):
     assert "Polygon" in captured.out
     assert "SECRET_API_KEY" not in captured.out
     assert "SECRET_API_KEY" not in captured.err
+
+
+def test_cli_stats_empty_db_no_token(tmp_path: Path, monkeypatch, capsys):
+    from hfwb.store import init_db
+    from tests.test_format import assert_no_plan7_forbidden_words
+
+    empty_db = tmp_path / "empty_stats.db"
+    init_db(empty_db)  # an existing but empty database; a missing one is an error (see below)
+    empty_env = tmp_path / "empty_token.env"
+    empty_env.write_text(f"HFWB_DB={empty_db}\n")
+
+    monkeypatch.setenv("HFWB_ENV_FILE", str(empty_env))
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("RPC_URL", raising=False)
+
+    exit_code = main(["--stats"])
+    assert exit_code == 0
+
+    captured = capsys.readouterr()
+    assert "Chats with tracked addresses: 0" in captured.out
+    assert "Watches: 0" in captured.out
+    assert "Depeg alerts: 0" in captured.out
+    assert "Custom levels chats: 0" in captured.out
+    assert "Pro interest:" in captured.out
+    assert "total: 0" in captured.out
+    assert "addresses: 0" in captured.out
+    assert "faster: 0" in captured.out
+    assert "levels: 0" in captured.out
+    assert "email: 0" in captured.out
+    assert "discord: 0" in captured.out
+    assert_no_plan7_forbidden_words(captured.out)
+
+
+def test_cli_stats_seeded_db(tmp_path: Path, monkeypatch, capsys):
+    from decimal import Decimal
+
+    from hfwb.store import (
+        add_depeg_subs,
+        add_tracked_address,
+        add_watch,
+        init_db,
+        set_levels,
+        set_pro_interest,
+    )
+    from tests.test_format import assert_no_plan7_forbidden_words
+
+    db_path = tmp_path / "seeded_stats.db"
+    init_db(db_path)
+    chat1 = 12345
+    chat2 = 67890
+    addr1 = "0x1111111111111111111111111111111111111111"
+    addr2 = "0x2222222222222222222222222222222222222222"
+
+    add_tracked_address(db_path, chat1, addr1)
+    add_tracked_address(db_path, chat1, addr2)
+    add_tracked_address(db_path, chat2, addr1)
+    add_watch(db_path, chat1, addr1, "m1")
+    add_watch(db_path, chat1, addr2, "m2")
+    add_watch(db_path, chat2, addr1, "m1")
+    add_depeg_subs(db_path, chat1, ["USDC", "USDT"])
+    set_levels(db_path, chat1, (Decimal("1.6"), Decimal("1.2")))
+    set_pro_interest(db_path, chat1, ["addresses", "faster"], 1000.0)
+    set_pro_interest(db_path, chat2, [], 1000.0)
+
+    empty_env = tmp_path / "empty_token.env"
+    empty_env.write_text(f"HFWB_DB={db_path}\n")
+    monkeypatch.setenv("HFWB_ENV_FILE", str(empty_env))
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("RPC_URL", raising=False)
+
+    exit_code = main(["--stats"])
+    assert exit_code == 0
+
+    captured = capsys.readouterr()
+    assert "Chats with tracked addresses: 2" in captured.out
+    assert "Watches: 3" in captured.out
+    assert "Depeg alerts: 2" in captured.out
+    assert "Custom levels chats: 1" in captured.out
+    assert "Pro interest:" in captured.out
+    assert "total: 2" in captured.out
+    assert "addresses: 1" in captured.out
+    assert "faster: 1" in captured.out
+    assert "levels: 0" in captured.out
+    assert "email: 0" in captured.out
+    assert "discord: 0" in captured.out
+
+    # No chat IDs, no addresses in output
+    assert str(chat1) not in captured.out
+    assert str(chat2) not in captured.out
+    assert addr1 not in captured.out
+    assert addr2 not in captured.out
+    assert "0x" not in captured.out
+
+    assert_no_plan7_forbidden_words(captured.out)
+
+
+
+def test_cli_stats_missing_db_fails_and_does_not_create_it(tmp_path: Path, monkeypatch, capsys):
+    missing = tmp_path / "typo.db"
+    env = tmp_path / "e.env"
+    env.write_text(f"HFWB_DB={missing}\n")
+    monkeypatch.setenv("HFWB_ENV_FILE", str(env))
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+
+    assert main(["--stats"]) == 1
+    assert not missing.exists()  # a wrong path must not silently create an empty database
+    assert "not found" in capsys.readouterr().err.lower()
+
+
+def test_cli_stats_is_read_only_and_tolerates_an_older_schema(tmp_path: Path, monkeypatch, capsys):
+    import sqlite3
+
+    from hfwb.store import init_db
+
+    old_db = tmp_path / "old.db"
+    init_db(old_db)
+    con = sqlite3.connect(old_db)
+    con.execute("DROP TABLE pro_interest")
+    con.execute("PRAGMA user_version = 3")
+    con.commit()
+    con.close()
+
+    env = tmp_path / "e.env"
+    env.write_text(f"HFWB_DB={old_db}\n")
+    monkeypatch.setenv("HFWB_ENV_FILE", str(env))
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+
+    assert main(["--stats"]) == 0
+    out = capsys.readouterr().out
+    assert "total: 0" in out  # the missing table counts as zero
+
+    con = sqlite3.connect(old_db)
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 3  # no migration was run
+    assert con.execute("SELECT name FROM sqlite_master WHERE name='pro_interest'").fetchone() is None
+    con.close()

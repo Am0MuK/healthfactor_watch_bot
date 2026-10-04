@@ -7,6 +7,7 @@ import pytest
 from hfwb.state import DEFAULT_LEVELS
 from hfwb.store import (
     DEFAULT_LEGACY_MARKET_KEY,
+    PRO_FEATURES,
     LimitError,
     TrackedAddress,
     WatchRecord,
@@ -14,22 +15,27 @@ from hfwb.store import (
     add_tracked_address,
     add_watch,
     clear_failure,
+    clear_pro_interest,
     delete_chat,
     distinct_addresses,
     distinct_pairs,
     get_levels,
+    get_pro_interest,
+    get_stats,
     get_table_columns,
     init_db,
     list_depeg_subs,
     list_tracked_addresses,
     list_watches,
     list_watches_by_address,
+    pro_interest_counts,
     record_failure,
     remove_address,
     remove_depeg_subs,
     remove_watch,
     reset_levels,
     set_levels,
+    set_pro_interest,
     subscribers_by_symbol,
     update_depeg_state,
     update_last_scan_ts,
@@ -87,7 +93,7 @@ def test_migration_from_old_schema(tmp_path: Path):
     conn = sqlite3.connect(str(old_db))
     cur = conn.cursor()
     cur.execute("PRAGMA user_version;")
-    assert cur.fetchone()[0] == 3
+    assert cur.fetchone()[0] == 4
 
     cur.execute("SELECT chat_id, address, market_key, state, last_alert_ts, fail_count FROM watches;")
     rows = cur.fetchall()
@@ -271,10 +277,10 @@ def test_tracked_address_rescan_ts(db_path: Path):
     assert tracked[0].last_scan_ts == 250.0
 
 
-def test_schema_user_version_3_and_chat_settings_table(db_path: Path):
+def test_schema_user_version_4_and_chat_settings_table(db_path: Path):
     with sqlite3.connect(str(db_path)) as conn:
         ver = conn.execute("PRAGMA user_version;").fetchone()[0]
-        assert ver == 3
+        assert ver == 4
 
     cols = get_table_columns(db_path, "chat_settings")
     forbidden = {"username", "user_name", "first_name", "last_name", "message", "text"}
@@ -326,7 +332,7 @@ def test_migration_from_v1_schema(tmp_path: Path):
 
     # Check upgraded version and preserved data
     conn = sqlite3.connect(str(v1_db))
-    assert conn.execute("PRAGMA user_version;").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version;").fetchone()[0] == 4
     row = conn.execute("SELECT chat_id, address, market_key, state, last_alert_ts, fail_count FROM watches;").fetchone()
     assert row == (1001, "0x1111111111111111111111111111111111111111", "m_key_1", "L2", 54321.0, 1)
     t_row = conn.execute("SELECT chat_id, address, last_scan_ts FROM tracked_addresses;").fetchone()
@@ -481,7 +487,7 @@ def test_migration_v2_to_v3(tmp_path: Path):
     conn = sqlite3.connect(str(v2_db))
     cur = conn.cursor()
     cur.execute("PRAGMA user_version;")
-    assert cur.fetchone()[0] == 3
+    assert cur.fetchone()[0] == 4
 
     # Check preserved rows
     cur.execute("SELECT chat_id, state FROM watches;")
@@ -571,4 +577,228 @@ def test_delete_chat_wipes_depeg_subs(db_path: Path):
 
     delete_chat(db_path, chat_id)
     assert list_depeg_subs(db_path, chat_id) == []
+
+
+def test_pro_interest_schema(db_path: Path):
+    cols = get_table_columns(db_path, "pro_interest")
+    forbidden = {"username", "user_name", "first_name", "last_name", "message", "text"}
+    for col in cols:
+        assert col.lower() not in forbidden
+    assert {"chat_id", "features", "created_ts"}.issubset(set(cols))
+
+
+def test_migration_v3_to_v4(tmp_path: Path):
+    v3_db = tmp_path / "v3.db"
+    conn = sqlite3.connect(str(v3_db))
+    conn.execute(
+        """
+        CREATE TABLE watches (
+            chat_id INTEGER NOT NULL,
+            address TEXT NOT NULL,
+            market_key TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'ok',
+            last_alert_ts REAL,
+            fail_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (chat_id, address, market_key)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE tracked_addresses (
+            chat_id INTEGER NOT NULL,
+            address TEXT NOT NULL,
+            last_scan_ts REAL,
+            PRIMARY KEY (chat_id, address)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE chat_settings (
+            chat_id INTEGER PRIMARY KEY,
+            levels TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE depeg_subs (
+            chat_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'ok',
+            last_alert_ts REAL,
+            PRIMARY KEY (chat_id, symbol)
+        );
+        """
+    )
+    conn.execute("PRAGMA user_version = 3;")
+    conn.execute(
+        "INSERT INTO watches (chat_id, address, market_key, state) VALUES (?, ?, ?, ?)",
+        (101, "0x1111111111111111111111111111111111111111", "m1", "L1"),
+    )
+    conn.execute(
+        "INSERT INTO depeg_subs (chat_id, symbol) VALUES (?, ?)",
+        (101, "USDC"),
+    )
+    conn.commit()
+    conn.close()
+
+    # Migrate via init_db
+    init_db(v3_db)
+
+    conn = sqlite3.connect(str(v3_db))
+    cur = conn.cursor()
+    cur.execute("PRAGMA user_version;")
+    assert cur.fetchone()[0] == 4
+
+    # Existing data preserved
+    cur.execute("SELECT chat_id, state FROM watches;")
+    assert cur.fetchall() == [(101, "L1")]
+    cur.execute("SELECT chat_id, symbol FROM depeg_subs;")
+    assert cur.fetchall() == [(101, "USDC")]
+
+    # pro_interest table exists and is empty
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pro_interest';")
+    assert cur.fetchone() is not None
+    cur.execute("SELECT COUNT(*) FROM pro_interest;")
+    assert cur.fetchone()[0] == 0
+    conn.close()
+
+
+def test_set_and_get_pro_interest(db_path: Path):
+    assert get_pro_interest(db_path, 123) is None
+
+    now = 1700000000.0
+    set_pro_interest(db_path, 123, ["addresses", "faster"], now)
+    interest = get_pro_interest(db_path, 123)
+    assert interest == ("addresses", "faster")
+
+
+def test_set_pro_interest_empty_list_stores_any(db_path: Path):
+    now = 1700000000.0
+    set_pro_interest(db_path, 123, [], now)
+    interest = get_pro_interest(db_path, 123)
+    assert interest == ("any",)
+
+    # Check raw DB content is 'any'
+    with sqlite3.connect(str(db_path)) as conn:
+        row = conn.execute("SELECT features, created_ts FROM pro_interest WHERE chat_id = 123;").fetchone()
+        assert row[0] == "any"
+        assert row[1] == now
+
+
+def test_set_pro_interest_upsert(db_path: Path):
+    t1 = 1000.0
+    t2 = 2000.0
+    set_pro_interest(db_path, 123, ["addresses"], t1)
+    assert get_pro_interest(db_path, 123) == ("addresses",)
+
+    set_pro_interest(db_path, 123, ["faster", "email"], t2)
+    assert get_pro_interest(db_path, 123) == ("faster", "email")
+
+    with sqlite3.connect(str(db_path)) as conn:
+        row = conn.execute("SELECT features, created_ts FROM pro_interest WHERE chat_id = 123;").fetchone()
+        assert row[0] == "faster,email"
+        assert row[1] == t2
+
+
+def test_clear_pro_interest(db_path: Path):
+    set_pro_interest(db_path, 123, ["addresses"], 1000.0)
+    assert get_pro_interest(db_path, 123) == ("addresses",)
+
+    clear_pro_interest(db_path, 123)
+    assert get_pro_interest(db_path, 123) is None
+
+
+def test_pro_interest_counts(db_path: Path):
+    # Empty DB
+    counts = pro_interest_counts(db_path)
+    expected_empty = {"total": 0, "addresses": 0, "faster": 0, "levels": 0, "email": 0, "discord": 0}
+    assert counts == expected_empty
+
+    # Chat 1: "any" -> counts in total only
+    set_pro_interest(db_path, 1, [], 1000.0)
+    counts1 = pro_interest_counts(db_path)
+    assert counts1["total"] == 1
+    for f in PRO_FEATURES:
+        assert counts1[f] == 0
+
+    # Chat 2: "addresses", "faster"
+    set_pro_interest(db_path, 2, ["addresses", "faster"], 1001.0)
+    # Chat 3: "addresses", "email", "discord"
+    set_pro_interest(db_path, 3, ["addresses", "email", "discord"], 1002.0)
+
+    counts2 = pro_interest_counts(db_path)
+    assert counts2["total"] == 3
+    assert counts2["addresses"] == 2
+    assert counts2["faster"] == 1
+    assert counts2["levels"] == 0
+    assert counts2["email"] == 1
+    assert counts2["discord"] == 1
+
+
+def test_delete_chat_wipes_pro_interest(db_path: Path):
+    set_pro_interest(db_path, 100, ["faster"], 1000.0)
+    set_pro_interest(db_path, 200, ["levels"], 1000.0)
+
+    delete_chat(db_path, 100)
+    assert get_pro_interest(db_path, 100) is None
+    assert get_pro_interest(db_path, 200) == ("levels",)
+
+
+def test_corrupt_stored_pro_interest_fallback(db_path: Path, caplog):
+    import logging
+    # Manually insert invalid features string
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "INSERT INTO pro_interest (chat_id, features, created_ts) VALUES (?, ?, ?)",
+            (999, "corrupted_feature,not_valid", 1000.0),
+        )
+        conn.commit()
+
+    with caplog.at_level(logging.WARNING):
+        interest = get_pro_interest(db_path, 999)
+    assert interest == ("any",)
+
+    # pro_interest_counts counts corrupt as "any" (in total only, no crash)
+    counts = pro_interest_counts(db_path)
+    assert counts["total"] == 1
+    for f in PRO_FEATURES:
+        assert counts[f] == 0
+
+
+def test_get_stats(db_path: Path):
+    # Empty DB stats
+    empty_stats = get_stats(db_path)
+    assert empty_stats["chats_with_tracked_addresses"] == 0
+    assert empty_stats["watches"] == 0
+    assert empty_stats["depeg_subs"] == 0
+    assert empty_stats["custom_levels_chats"] == 0
+    assert empty_stats["pro_interest"] == {"total": 0, "addresses": 0, "faster": 0, "levels": 0, "email": 0, "discord": 0}
+
+    # Seed DB
+    addr1 = "0x1111111111111111111111111111111111111111"
+    addr2 = "0x2222222222222222222222222222222222222222"
+    add_tracked_address(db_path, 1, addr1)
+    add_tracked_address(db_path, 1, addr2)
+    add_tracked_address(db_path, 2, addr1)
+    add_watch(db_path, 1, addr1, "m1")
+    add_watch(db_path, 1, addr2, "m2")
+    add_watch(db_path, 2, addr1, "m1")
+    add_depeg_subs(db_path, 1, ["USDC", "USDT"])
+    set_levels(db_path, 1, (Decimal("1.6"), Decimal("1.2")))
+    set_pro_interest(db_path, 1, ["addresses", "faster"], 1000.0)
+    set_pro_interest(db_path, 2, [], 1000.0)
+
+    stats = get_stats(db_path)
+    assert stats["chats_with_tracked_addresses"] == 2
+    assert stats["watches"] == 3
+    assert stats["depeg_subs"] == 2
+    assert stats["custom_levels_chats"] == 1
+    assert stats["pro_interest"]["total"] == 2
+    assert stats["pro_interest"]["addresses"] == 1
+    assert stats["pro_interest"]["faster"] == 1
+    assert stats["pro_interest"]["levels"] == 0
+
 

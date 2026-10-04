@@ -1,5 +1,6 @@
 import re
 from decimal import Decimal
+from pathlib import Path
 
 from hfwb.aave import AccountData
 from hfwb.format import (
@@ -21,6 +22,10 @@ from hfwb.format import (
     format_market_name,
     format_new_position,
     format_privacy,
+    format_pro_cleared,
+    format_pro_error,
+    format_pro_info,
+    format_pro_saved,
     format_rate_limit,
     format_remove,
     format_rescan_rate_limit,
@@ -643,4 +648,129 @@ def test_privacy_and_help_include_depeg():
     hlp = format_help()
     assert "/depeg" in hlp
     assert_no_forbidden_words(hlp)
+
+
+PLAN7_FORBIDDEN_WORDS = [
+    "buy",
+    "sell",
+    "deposit",
+    "repay",
+    "add collateral",
+    "should",
+    "you need to",
+    "act now",
+    "price",
+    "pay",
+    "payment",
+    "subscribe",
+    "subscription",
+    "per month",
+    "euro",
+    "dollar",
+]
+
+
+def assert_no_plan7_forbidden_words(text: str, allow_no_way_to_pay_yet: bool = False) -> None:
+    text_lower = text.lower()
+    if allow_no_way_to_pay_yet:
+        assert text_lower.count("no way to pay yet") == 1, (
+            f"Expected 'no way to pay yet' exactly once in:\n{text}"
+        )
+        text_lower = text_lower.replace("no way to pay yet", "")
+    for word in PLAN7_FORBIDDEN_WORDS:
+        if " " in word:
+            assert word not in text_lower, f"Forbidden phrase '{word}' found in message:\n{text}"
+        else:
+            pattern = rf"\b{re.escape(word)}\b"
+            assert not re.search(pattern, text_lower), (
+                f"Forbidden word '{word}' found in message:\n{text}"
+            )
+
+
+def test_format_pro_info_no_current():
+    msg = format_pro_info(None)
+    assert "Ideas for a paid plan. Nothing is charged and there is no way to pay yet." in msg
+    assert "The bot stays free for up to 3 addresses per chat." in msg
+    assert "addresses (more than 3), faster (more frequent reads), levels (alert levels per address), email, discord." in msg
+    assert "Example: /pro yes addresses faster." in msg
+    assert "/pro no removes your answer." in msg
+    assert "Your current answer" not in msg
+
+
+def test_format_pro_info_with_current():
+    msg_any = format_pro_info(("any",))
+    assert "Your current answer: <b>any</b>." in msg_any
+
+    msg_feat = format_pro_info(("addresses", "faster"))
+    assert "Your current answer: <b>addresses, faster</b>." in msg_feat
+
+
+def test_format_pro_saved():
+    msg_any = format_pro_saved([])
+    assert "Saved your interest: <b>any</b>." in msg_any
+
+    msg_feat = format_pro_saved(["addresses", "faster"])
+    assert "Saved your interest: <b>addresses, faster</b>." in msg_feat
+
+
+def test_format_pro_cleared():
+    msg = format_pro_cleared()
+    assert "Removed your answer." in msg
+
+
+def test_format_pro_error():
+    err = format_pro_error("foo")
+    assert "foo" in err
+    assert "addresses, faster, levels, email, discord" in err
+
+
+def test_format_watch_limit_hint():
+    msg = format_watch_limit()
+    assert "Need more? See /pro." in msg
+
+
+def test_start_help_privacy_include_pro():
+    start = format_start()
+    assert "/pro" in start
+
+    help_text = format_help()
+    assert "/pro" in help_text
+
+    priv = format_privacy()
+    assert "/pro" in priv
+
+
+def test_forbidden_words_on_all_new_texts():
+    samples_with_pay_exception = [
+        format_pro_info(None),
+        format_pro_info(("any",)),
+        format_pro_info(("addresses", "faster")),
+    ]
+    for s in samples_with_pay_exception:
+        assert_no_plan7_forbidden_words(s, allow_no_way_to_pay_yet=True)
+
+    other_samples = [
+        format_pro_saved([]),
+        format_pro_saved(["any"]),
+        format_pro_saved(["addresses", "faster", "levels", "email", "discord"]),
+        format_pro_cleared(),
+        format_pro_error("unknown_feature"),
+        format_watch_limit(),
+        format_start(),
+        format_help(),
+        format_privacy(),
+    ]
+    for s in other_samples:
+        assert_no_plan7_forbidden_words(s, allow_no_way_to_pay_yet=False)
+
+
+def test_readme_pro_section_forbidden_words():
+    readme_text = Path("README.md").read_text(encoding="utf-8")
+    assert "## Paid Plan Interest (`/pro`)" in readme_text
+    section = readme_text.split("## Paid Plan Interest (`/pro`)")[1].split("## Privacy")[0]
+    assert_no_plan7_forbidden_words(section, allow_no_way_to_pay_yet=False)
+    for extra in ["payment", "price", "promise"]:
+        assert extra not in section.lower()
+
+
 

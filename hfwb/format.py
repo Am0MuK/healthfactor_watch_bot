@@ -206,6 +206,7 @@ def format_start() -> str:
         "/rescan &lt;address&gt; - Rescan all markets for an address (max once per 5 min)\n"
         "/levels [levels|reset] - View or set custom alert levels per chat\n"
         "/depeg [on|off] - Configure stablecoin depeg alerts (default off)\n"
+        "/pro [yes|no] - View ideas and express interest\n"
         "/list - List monitored addresses and positions\n"
         "/remove &lt;address&gt; - Stop watching an address\n"
         "/privacy - View privacy information\n"
@@ -222,7 +223,8 @@ def format_privacy() -> str:
     return (
         "Privacy Notice:\n\n"
         "This bot stores chat_id, wallet address, market list, and alert state only "
-        "(plus subscribed token symbols for stablecoin depeg alerts).\n"
+        "(plus subscribed token symbols for stablecoin depeg alerts, "
+        "and your optional answer to /pro).\n"
         "No names, usernames, or message text are stored.\n"
         "Wallet addresses are public on chain but personal data under GDPR. "
         "Retention is until /remove or /delete, plus auto-removal if the bot is blocked.\n"
@@ -329,7 +331,10 @@ def format_watch_failure(address: str) -> str:
 
 
 def format_watch_limit() -> str:
-    return "Limit reached: maximum 3 addresses per chat. Use /remove &lt;address&gt; or /delete."
+    return (
+        "Limit reached: maximum 3 addresses per chat. Use /remove &lt;address&gt; or /delete.\n"
+        "Need more? See /pro."
+    )
 
 
 def format_positions_limit() -> str:
@@ -587,3 +592,43 @@ def format_depeg_error(msg: str, supported: Sequence[str]) -> str:
     esc_msg = html.escape(msg)
     esc_sup = ", ".join(html.escape(s) for s in supported)
     return f"Invalid stablecoin symbol: <b>{esc_msg}</b>\n\nSupported stablecoins: {esc_sup}"
+
+
+def format_pro_info(current: tuple[str, ...] | None = None) -> str:
+    """Format /pro informational message with optional current answer line."""
+    msg = (
+        "Ideas for a paid plan. Nothing is charged and there is no way to pay yet. "
+        "The bot stays free for up to 3 addresses per chat.\n\n"
+        "If you would use any of these, say so with /pro yes and optionally list what matters to you: "
+        "addresses (more than 3), faster (more frequent reads), levels (alert levels per address), "
+        "email, discord.\n\n"
+        "Example: /pro yes addresses faster.\n"
+        "/pro no removes your answer."
+    )
+    if current is not None:
+        ans = ", ".join(current) if current else "any"
+        msg += f"\n\nYour current answer: <b>{html.escape(ans)}</b>."
+    return msg
+
+
+def format_pro_saved(features: Sequence[str] | str) -> str:
+    """Format confirmation message after saving pro interest."""
+    if isinstance(features, str):
+        val = features
+    else:
+        val = ", ".join(features) if features else "any"
+    return f"Saved your interest: <b>{html.escape(val)}</b>."
+
+
+def format_pro_cleared() -> str:
+    """Format confirmation message after clearing pro interest."""
+    return "Removed your answer."
+
+
+def format_pro_error(msg: str) -> str:
+    """Format error message for unknown pro feature names listing valid ones."""
+    return (
+        f"Unknown feature: <b>{html.escape(msg[:30])}</b>.\n\n"
+        "Valid features: addresses, faster, levels, email, discord."
+    )
+

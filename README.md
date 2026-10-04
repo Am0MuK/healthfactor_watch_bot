@@ -21,6 +21,7 @@ A Telegram bot that monitors Aave V3 (20 EVM chains) and Aave V4 (19 spokes acro
 - `/levels [levels|reset]` - View or configure custom alert levels for this chat (e.g. `/levels 1.5 1.3 1.15 1.05` or `/levels reset`).
 - `/depeg [on|off [symbols...]]` - View status or configure opt-in stablecoin depeg alerts (e.g. `/depeg on` for all 12 tokens, `/depeg on USDC USDT`, or `/depeg off`).
 - `/list` - Display all monitored addresses grouped with their active market positions and alert states.
+- `/pro [yes|no [features...]]` - View ideas and express interest in future options (e.g. `/pro`, `/pro yes addresses faster`, or `/pro no`).
 - `/remove <address>` - Stop monitoring an address and all its market positions.
 - `/privacy` - View privacy notice and data retention terms.
 - `/delete` - Permanently remove all data and watches for this chat.
@@ -220,9 +221,34 @@ The failure streak resets to 0 immediately upon the next successful read.
 
 A background worker checks tracked addresses once every 24 hours. When an address opens a position in a new market, the bot automatically adds a watch for that market and notifies the chat (`Found a new position: ...`).
 
+## Paid Plan Interest (`/pro`)
+
+The bot is free for up to 3 addresses per chat. Before considering extra options, `/pro` measures whether anyone wants more.
+
+Nothing can be bought. It records only an optional closed list of feature ideas that a chat would use:
+- `addresses`: more than 3 addresses
+- `faster`: more frequent reads
+- `levels`: alert levels per address
+- `email`: e-mail alerts
+- `discord`: Discord alerts
+
+Commands:
+- `/pro` - View ideas and your current answer.
+- `/pro yes` - Express interest (no preference).
+- `/pro yes addresses faster` - Express interest in specific features.
+- `/pro no` - Remove your answer.
+
+### Usage Statistics (`--stats`)
+
+Aggregate statistics can be printed directly from the database without starting the bot, reaching the network, or needing a bot token:
+```bash
+.venv/bin/hfwb --stats
+```
+This prints the number of chats with tracked addresses, watches, depeg alerts, custom levels chats, and interest counts (total and per feature). No chat IDs or wallet addresses are output.
+
 ## Privacy
 
-- The database stores only `chat_id`, monitored `address`, `market_key`, alert `state`, `last_alert_ts`, `fail_count`, `last_scan_ts`, and subscribed stablecoin symbols.
+- The database stores only `chat_id`, monitored `address`, `market_key`, alert `state`, `last_alert_ts`, `fail_count`, `last_scan_ts`, subscribed stablecoin symbols, and optional feature interest from `/pro`.
 - No user names, handles, or message contents are recorded.
 - Retention is strictly "until `/remove` or `/delete`".
 - If Telegram reports HTTP 403 ("bot was blocked by the user"), all rows for that chat are automatically deleted.
@@ -261,7 +287,13 @@ Secrets are never printed in exception messages, CLI outputs, or application log
    ```
    Tests an `eth_call` on `0x000000000000000000000000000000000000dEaD` for every market and prints status without printing RPC URLs or keys.
 
-4. Run the bot:
+4. Inspect database statistics and feature interest:
+   ```bash
+   .venv/bin/hfwb --stats
+   ```
+   Reads the local database and prints summary counts without network or token requirements.
+
+5. Run the bot:
    ```bash
    .venv/bin/hfwb
    ```
