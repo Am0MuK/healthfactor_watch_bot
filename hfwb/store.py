@@ -1,8 +1,14 @@
+import logging
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
+
+from hfwb.state import DEFAULT_LEVELS, validate_levels
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_LEGACY_MARKET_KEY = "aave_v3:42161:0x794a61358d6845594f94dc1db02a252b5b4814ad"
 MAX_ADDRESSES_PER_CHAT = 3
@@ -117,7 +123,16 @@ def init_db(db_path: str | Path) -> None:
                 """
             )
 
-        conn.execute("PRAGMA user_version = 1;")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_settings (
+                chat_id INTEGER PRIMARY KEY,
+                levels TEXT NOT NULL
+            );
+            """
+        )
+
+        conn.execute("PRAGMA user_version = 2;")
 
 
 def add_tracked_address(
@@ -433,14 +448,71 @@ def update_state(
 
 
 def delete_chat(db_path: str | Path, chat_id: int) -> int:
-    """Delete all watches and tracked addresses for a chat. Returns total deleted records."""
+    """Delete all watches, tracked addresses, and settings for a chat. Returns total deleted records."""
     with get_connection(db_path) as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM watches WHERE chat_id = ?", (chat_id,))
         w_count = cur.rowcount
         cur.execute("DELETE FROM tracked_addresses WHERE chat_id = ?", (chat_id,))
         t_count = cur.rowcount
+        cur.execute("DELETE FROM chat_settings WHERE chat_id = ?", (chat_id,))
         return max(w_count, t_count)
+
+
+def get_levels(db_path: str | Path, chat_id: int) -> tuple[Decimal, ...]:
+    """Return configured alert levels for chat_id, or DEFAULT_LEVELS."""
+    with get_connection(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT levels FROM chat_settings WHERE chat_id = ?", (chat_id,))
+        row = cur.fetchone()
+        if not row:
+            return DEFAULT_LEVELS
+        raw = row[0]
+        try:
+            tokens = [t.strip() for t in raw.split(",") if t.strip()]
+            return validate_levels(tokens)
+        except Exception as exc:  # noqa: BLE001 - fallback on corrupt stored values
+            logger.warning(
+                "Corrupt alert levels stored for chat %s ('%s'): %s. Falling back to default levels.",
+                chat_id,
+                raw,
+                exc,
+            )
+            return DEFAULT_LEVELS
+
+
+def set_levels(
+    db_path: str | Path,
+    chat_id: int,
+    levels: Sequence[Decimal],
+) -> None:
+    """Set alert levels for chat_id and reset all watches for that chat to ok in one transaction."""
+    levels_str = ",".join(str(lvl) for lvl in levels)
+    with get_connection(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO chat_settings (chat_id, levels)
+            VALUES (?, ?)
+            ON CONFLICT (chat_id) DO UPDATE SET levels = excluded.levels
+            """,
+            (chat_id, levels_str),
+        )
+        cur.execute(
+            "UPDATE watches SET state = 'ok', last_alert_ts = NULL WHERE chat_id = ?",
+            (chat_id,),
+        )
+
+
+def reset_levels(db_path: str | Path, chat_id: int) -> None:
+    """Reset alert levels for chat_id to default and reset all watches for that chat to ok."""
+    with get_connection(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM chat_settings WHERE chat_id = ?", (chat_id,))
+        cur.execute(
+            "UPDATE watches SET state = 'ok', last_alert_ts = NULL WHERE chat_id = ?",
+            (chat_id,),
+        )
 
 
 def record_failure(

@@ -8,6 +8,10 @@ from hfwb.format import (
     format_alert,
     format_delete,
     format_help,
+    format_levels,
+    format_levels_error,
+    format_levels_reset,
+    format_levels_saved,
     format_list,
     format_market_name,
     format_new_position,
@@ -24,9 +28,11 @@ from hfwb.format import (
     format_watch_success,
     hf_emoji,
     hf_gauge,
+    level_emoji,
     profile_link,
 )
 from hfwb.markets import Market
+from hfwb.state import DEFAULT_LEVELS
 
 FORBIDDEN_WORDS = [
     "buy",
@@ -354,6 +360,113 @@ def test_all_messages_forbidden_words():
         format_remove("0x794a61358d6845594f94dc1db02a252b5b4814ad", removed=False),
         format_scan_response("0x794a61358d6845594f94dc1db02a252b5b4814ad", [], 0),
         format_new_position("0x794a61358d6845594f94dc1db02a252b5b4814ad", M_V3, Decimal("1.5")),
+        format_levels(DEFAULT_LEVELS, is_default=True),
+        format_levels((Decimal("1.8"), Decimal("1.4")), is_default=False),
+        format_levels_error("Invalid"),
+        format_levels_saved((Decimal("1.8"), Decimal("1.4"))),
+        format_levels_reset(),
     ]
     for sample in samples:
         assert_no_forbidden_words(sample)
+
+
+def test_level_emoji():
+    # n=4: r = 4 - k
+    assert level_emoji(4, 4) == "🚨"  # r=0
+    assert level_emoji(3, 4) == "🔴"  # r=1
+    assert level_emoji(2, 4) == "🟠"  # r=2
+    assert level_emoji(1, 4) == "🟡"  # r=3
+
+    # n=2:
+    assert level_emoji(2, 2) == "🚨"  # r=0
+    assert level_emoji(1, 2) == "🔴"  # r=1
+
+    # n=3:
+    assert level_emoji(3, 3) == "🚨"  # r=0
+    assert level_emoji(2, 3) == "🔴"  # r=1
+    assert level_emoji(1, 3) == "🟠"  # r=2
+
+    # n=5:
+    assert level_emoji(5, 5) == "🚨"  # r=0
+    assert level_emoji(4, 5) == "🔴"  # r=1
+    assert level_emoji(3, 5) == "🟠"  # r=2
+    assert level_emoji(2, 5) == "🟡"  # r=3
+    assert level_emoji(1, 5) == "🟡"  # r=4
+
+
+def test_hf_emoji_custom_levels():
+    levels = (Decimal("2.0"), Decimal("1.5"))
+    assert hf_emoji(None, levels=levels) == "🟢"
+    assert hf_emoji(Decimal("2.5"), levels=levels) == "🟢"
+    assert hf_emoji(Decimal("2.0"), levels=levels) == "🟢"
+    assert hf_emoji(Decimal("1.8"), levels=levels) == "🔴"  # below 2.0 (k=1, r=1)
+    assert hf_emoji(Decimal("1.4"), levels=levels) == "🚨"  # below 1.5 (k=2, r=0)
+
+
+def test_format_alert_custom_levels():
+    levels = (Decimal("1.8"), Decimal("1.4"), Decimal("1.2"))
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+
+    # L1 alert: Fell below 1.8; emoji is level_emoji(1, 3) = 🟠; NOT in lowest two levels
+    msg_l1 = format_alert("L1", addr, Decimal("1.7"), market=M_V3, levels=levels)
+    assert "🟠 <b>Aave V3 · Base</b>" in msg_l1
+    assert "Fell below <b>1.8</b>" in msg_l1
+    assert "Close to liquidation (1.00)" not in msg_l1
+
+    # L2 alert: Fell below 1.4; emoji is level_emoji(2, 3) = 🔴; IS in lowest two levels
+    msg_l2 = format_alert("L2", addr, Decimal("1.3"), market=M_V3, levels=levels)
+    assert "🔴 <b>Aave V3 · Base</b>" in msg_l2
+    assert "Fell below <b>1.4</b>" in msg_l2
+    assert "Close to liquidation (1.00)" in msg_l2
+
+    # repeat_L2 alert: Still below 1.4
+    msg_rep = format_alert("repeat_L2", addr, Decimal("1.3"), market=M_V3, levels=levels)
+    assert "Still below <b>1.4</b>" in msg_rep
+    assert "Next reminder in 30 min" in msg_rep
+    assert "Close to liquidation (1.00)" in msg_rep
+
+    # Recovery alert: Back above 1.8 (names levels[0])
+    msg_rec = format_alert("recovery", addr, Decimal("1.9"), market=M_V3, levels=levels)
+    assert "🟢 <b>Aave V3 · Base</b>" in msg_rec
+    assert "Back above <b>1.8</b>" in msg_rec
+
+
+def test_format_list_levels_footer():
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    grouped = [(addr, [("Aave V3 · Base", "ok")])]
+
+    # With default levels
+    msg_default = format_list(grouped, levels=DEFAULT_LEVELS)
+    assert msg_default.strip().endswith("Levels: 1.4 / 1.2 / 1.1 / 1.05 (default)")
+
+    # With custom levels
+    custom = (Decimal("1.8"), Decimal("1.4"), Decimal("1.2"))
+    msg_custom = format_list(grouped, levels=custom)
+    assert msg_custom.strip().endswith("Levels: 1.8 / 1.4 / 1.2")
+    assert "(default)" not in msg_custom
+
+
+def test_format_levels_functions():
+    msg_curr = format_levels(DEFAULT_LEVELS, is_default=True)
+    assert "1.4 / 1.2 / 1.1 / 1.05" in msg_curr
+    assert "(default)" in msg_curr
+    assert_no_forbidden_words(msg_curr)
+
+    custom = (Decimal("1.8"), Decimal("1.4"), Decimal("1.2"))
+    msg_custom = format_levels(custom, is_default=False)
+    assert "1.8 / 1.4 / 1.2" in msg_custom
+    assert "(default)" not in msg_custom
+    assert_no_forbidden_words(msg_custom)
+
+    msg_err = format_levels_error("Must specify between 2 and 5 alert levels")
+    assert "Must specify between 2 and 5 alert levels" in msg_err
+    assert_no_forbidden_words(msg_err)
+
+    msg_saved = format_levels_saved(custom)
+    assert "1.8 / 1.4 / 1.2" in msg_saved
+    assert "re-armed" in msg_saved
+    assert_no_forbidden_words(msg_saved)
+
+    msg_reset = format_levels_reset()
+    assert "1.4 / 1.2 / 1.1 / 1.05" in msg_reset
+    assert_no_forbidden_words(msg_reset)

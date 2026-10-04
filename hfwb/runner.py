@@ -6,6 +6,7 @@ import urllib.parse
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from hfwb.store import (
     delete_chat,
     distinct_pairs,
     get_due_rescans,
+    get_levels,
     list_watches,
     list_watches_by_address,
     record_failure,
@@ -91,6 +93,12 @@ def poll_once(
                 results[(m_key, addr)] = outcome
 
     now = clock()
+    chat_levels_cache: dict[int, tuple[Decimal, ...]] = {}
+
+    def _get_chat_levels(chat_id: int) -> tuple[Decimal, ...]:
+        if chat_id not in chat_levels_cache:
+            chat_levels_cache[chat_id] = get_levels(db_path, chat_id)
+        return chat_levels_cache[chat_id]
 
     for (m_key, addr), outcome in results.items():
         market = market_map.get(m_key) or get_market(m_key)
@@ -120,11 +128,13 @@ def poll_once(
         clear_failure(db_path, m_key, addr)
         watches = list_watches_by_address(db_path, addr, market_key=m_key)
         for watch in watches:
+            chat_levels = _get_chat_levels(watch.chat_id)
             new_state, alert = step(
                 prev_state=watch.state,
                 hf=outcome.hf,
                 now_ts=now,
                 last_alert_ts=watch.last_alert_ts,
+                levels=chat_levels,
             )
 
             if alert is not None:
@@ -135,6 +145,7 @@ def poll_once(
                     collateral_usd=outcome.collateral_usd,
                     debt_usd=outcome.debt_usd,
                     market=market,
+                    levels=chat_levels,
                 )
                 try:
                     tg_client.send_message(watch.chat_id, alert_text)
@@ -177,6 +188,12 @@ def rescan_due_addresses(
         return
 
     all_markets = list(markets) if markets is not None else load_markets()
+    chat_levels_cache: dict[int, tuple[Decimal, ...]] = {}
+
+    def _get_chat_levels(chat_id: int) -> tuple[Decimal, ...]:
+        if chat_id not in chat_levels_cache:
+            chat_levels_cache[chat_id] = get_levels(db_path, chat_id)
+        return chat_levels_cache[chat_id]
 
     # Group due records by address
     addrs_to_chats: dict[str, list[int]] = defaultdict(list)
@@ -187,12 +204,13 @@ def rescan_due_addresses(
         try:
             scan_res = scanner_fn(addr, all_markets, reader=reader_fn)
             for chat_id in chat_ids:
+                chat_levels = _get_chat_levels(chat_id)
                 existing_watches = list_watches(db_path, chat_id, address=addr)
                 watched_keys = {w.market_key for w in existing_watches}
 
                 for market, acct in scan_res.found:
                     if market.key not in watched_keys:
-                        initial_state, _ = step("ok", acct.hf, now_ts=now, last_alert_ts=None)
+                        initial_state, _ = step("ok", acct.hf, now_ts=now, last_alert_ts=None, levels=chat_levels)
                         try:
                             add_watch(db_path, chat_id, addr, market.key, state=initial_state)
                         except LimitError:
@@ -204,6 +222,7 @@ def rescan_due_addresses(
                             acct.hf,
                             collateral_usd=acct.collateral_usd,
                             debt_usd=acct.debt_usd,
+                            levels=chat_levels,
                         )
                         try:
                             tg_client.send_message(chat_id, msg)

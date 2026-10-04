@@ -18,6 +18,7 @@ A Telegram bot that monitors Aave V3 (20 EVM chains) and Aave V4 (19 spokes acro
 - `/start` - Introduction and usage instructions.
 - `/watch <address>` - Scan all supported markets for an Ethereum address and monitor active positions (max 3 addresses per chat).
 - `/rescan <address>` - Scan all supported markets on demand to detect new positions (rate limit: once per 5 minutes per chat).
+- `/levels [levels|reset]` - View or configure custom alert levels for this chat (e.g. `/levels 1.5 1.3 1.15 1.05` or `/levels reset`).
 - `/list` - Display all monitored addresses grouped with their active market positions and alert states.
 - `/remove <address>` - Stop monitoring an address and all its market positions.
 - `/privacy` - View privacy notice and data retention terms.
@@ -83,6 +84,8 @@ Account: 0x794a…14ad
 Informational only, not financial advice.
 ```
 
+### Default Alert Levels
+
 | Emoji | Threshold | Status | Action |
 |---|---|---|---|
 | 🟡 | 1.40 | L1 | Alert once on downward crossing |
@@ -93,22 +96,35 @@ Informational only, not financial advice.
 
 ## Alert Levels and Hysteresis
 
-The alert ladder monitors positions across five states: `ok`, `L1`, `L2`, `L3`, and `L4`, with levels `LEVELS = (1.4, 1.2, 1.1, 1.05)` and `HYST = 0.03`:
-- `ok`: Health factor >= 1.40
-- `L1`: Health factor < 1.40
-- `L2`: Health factor < 1.20
-- `L3`: Health factor < 1.10
-- `L4`: Health factor < 1.05 (liquidation occurs at 1.0)
+Alert levels are configured per Telegram chat (not per wallet address). By default, every chat uses `DEFAULT_LEVELS = (1.4, 1.2, 1.1, 1.05)` with `ok` (HF >= 1.40), `L1` (< 1.40), `L2` (< 1.20), `L3` (< 1.10), and `L4` (< 1.05).
 
-Key transition rules:
-- **Downward crossings**: An automatic alert is sent each time health factor crosses downward into a new level. A downward jump over several levels sends a single alert naming the deepest level reached (e.g. `HF fell below 1.05`).
-- **Hysteresis**: Hysteresis is 0.03 per level. A less severe state is re-armed only when health factor rises above that level + 0.03:
-  - Recovery from `L4` to `L3` requires HF >= 1.08.
-  - Recovery from `L3` to `L2` requires HF >= 1.13.
-  - Recovery from `L2` to `L1` requires HF >= 1.23.
-  - Recovery back to `ok` requires HF >= 1.43.
-- **Alert frequency**: While in `L3` or `L4`, reminders repeat every 30 minutes.
-- **Recovery notification**: A recovery alert is dispatched when health factor returns to `ok` (HF >= 1.43). Upward moves between intermediate levels do not send notifications.
+### Custom Levels (`/levels`)
+
+Users can customize alert thresholds for their chat using `/levels <l1> <l2> ...` (or separated by commas, e.g. `/levels 1.5 1.3 1.15 1.05` or `/levels 1.6,1.4,1.2`), and restore defaults with `/levels reset`.
+
+Validation rules for custom levels:
+- **Count**: 2 to 5 levels.
+- **Order**: Strictly descending (e.g. 1.8 > 1.4 > 1.2).
+- **Range**: Each level between 1.01 and 5.0 inclusive (a level may be set above 1.4).
+- **Minimum gap**: At least 0.04 between consecutive levels.
+- **Precision**: At most 2 decimal places per value.
+
+### Re-Arm Behavior
+
+When alert levels are changed or reset with `/levels`, all current watch states for that chat are immediately reset to `ok` and alert timestamps are cleared in the database. During the next poll cycle, the bot re-evaluates all active positions against the new thresholds, so an alert may arrive immediately if a position is currently below a configured level.
+
+### Transition Rules
+
+- **Downward crossings**: An automatic alert is sent each time health factor crosses downward into a new level. A downward jump over several levels sends a single alert naming the deepest level reached (e.g. `Fell below 1.05`).
+- **Dynamic hysteresis**: Hysteresis is calculated from the levels: `hyst = min(0.03, 0.6 * min_gap)` where `min_gap` is the smallest difference between consecutive levels. For the default levels this is exactly 0.03; for a minimum gap of 0.04 it is 0.024. A less severe state is re-armed only when health factor rises above that level + `hyst`:
+  - With default levels, recovery from `L4` to `L3` requires HF >= 1.08; `L3` to `L2` requires HF >= 1.13; `L2` to `L1` requires HF >= 1.23; `L1` back to `ok` requires HF >= 1.43.
+- **Emoji ranking**: Alert emoji are determined by distance from the lowest level (`r = n - k`):
+  - `r = 0` (lowest level, `Ln`): 🚨
+  - `r = 1`: 🔴
+  - `r = 2`: 🟠
+  - `r >= 3`: 🟡
+- **Alert frequency**: While in the lowest two levels (`k >= n - 1`, e.g. `L3` and `L4` for 4 levels, or both `L1` and `L2` for 2 levels), reminders repeat every 30 minutes.
+- **Recovery notification**: A recovery alert is dispatched only when health factor returns to `ok` (`HF >= levels[0] + hyst`), naming the top threshold. Upward moves between intermediate levels do not send notifications.
 - **No debt**: When an account has no debt (health factor sentinel `2^256 - 1`), it is mapped to `ok` (with a recovery notification if previously non-ok).
 - **RPC failures**: On RPC node failures, the previous known state is preserved. An internal failure counter increments per `(market, address)` pair; after 3 consecutive failures an error is recorded in server logs without user-facing spam.
 

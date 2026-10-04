@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
-from hfwb.state import LEVELS
+from hfwb.state import DEFAULT_LEVELS, LEVELS
 
 FOOTER = "<i>Informational only, not financial advice.</i>"
 
@@ -20,23 +20,38 @@ STATE_EMOJIS: dict[str, str] = {
 }
 
 
-def hf_emoji(hf: Decimal | None) -> str:
+def level_emoji(k: int, n: int) -> str:
+    """Map 1-indexed level k out of n total levels to an emoji based on distance from the bottom.
+
+    r = n - k: r=0 -> 🚨, r=1 -> 🔴, r=2 -> 🟠, r>=3 -> 🟡.
+    """
+    r = n - k
+    if r <= 0:
+        return "🚨"
+    if r == 1:
+        return "🔴"
+    if r == 2:
+        return "🟠"
+    return "🟡"
+
+
+def hf_emoji(hf: Decimal | None, levels: Sequence[Decimal] = DEFAULT_LEVELS) -> str:
     """Return health factor emoji.
 
-    None (no debt) or HF >= 1.4 -> 🟢; < 1.4 -> 🟡; < 1.2 -> 🟠; < 1.1 -> 🔴; < 1.05 -> 🚨.
+    None (no debt) or hf >= levels[0] -> 🟢, otherwise the emoji of the deepest level the hf is below.
     """
     if hf is None:
         return "🟢"
     val = Decimal(str(hf))
-    if val >= LEVELS[0]:
+    if val >= levels[0]:
         return "🟢"
-    if val < LEVELS[3]:
-        return "🚨"
-    if val < LEVELS[2]:
-        return "🔴"
-    if val < LEVELS[1]:
-        return "🟠"
-    return "🟡"
+    deepest = 1
+    for i, thresh in enumerate(levels, start=1):
+        if val < thresh:
+            deepest = i
+        else:
+            break
+    return level_emoji(deepest, len(levels))
 
 
 def state_emoji(state: str) -> str:
@@ -121,9 +136,10 @@ def format_alert(
     collateral_usd: Decimal | None = None,
     debt_usd: Decimal | None = None,
     market: Any | None = None,
+    levels: Sequence[Decimal] = DEFAULT_LEVELS,
 ) -> str:
     """Format an alert notification naming the level reached and the market in HTML."""
-    emoji = hf_emoji(hf)
+    emoji = hf_emoji(hf, levels=levels)
     if alert_type == "recovery":
         emoji = "🟢"
 
@@ -134,21 +150,27 @@ def format_alert(
     gauge = hf_gauge(hf)
     lines.append(f"Health factor <b>{hf_str}</b>  {gauge}")
 
+    n = len(levels)
     is_critical = False
-    if alert_type in LEVEL_THRESHOLDS:
-        thresh = LEVEL_THRESHOLDS[alert_type]
+    if alert_type.startswith("L") and alert_type[1:].isdigit():
+        k = int(alert_type[1:])
+        thresh = levels[k - 1] if 1 <= k <= n else levels[-1]
         lines.append(f"Fell below <b>{thresh}</b>")
-        if alert_type in ("L3", "L4"):
+        if k >= (n - 1):
             is_critical = True
     elif alert_type.startswith("repeat_"):
         lvl = alert_type.removeprefix("repeat_")
-        thresh = LEVEL_THRESHOLDS.get(lvl, "")
-        lines.append(f"Still below <b>{thresh}</b>")
-        lines.append("Next reminder in 30 min")
-        if lvl in ("L3", "L4"):
-            is_critical = True
+        if lvl.startswith("L") and lvl[1:].isdigit():
+            k = int(lvl[1:])
+            thresh = levels[k - 1] if 1 <= k <= n else levels[-1]
+            lines.append(f"Still below <b>{thresh}</b>")
+            lines.append("Next reminder in 30 min")
+            if k >= (n - 1):
+                is_critical = True
+        else:
+            lines.append(f"Update: <b>{html.escape(alert_type)}</b>")
     elif alert_type == "recovery":
-        lines.append(f"Back above <b>{LEVELS[0]}</b>")
+        lines.append(f"Back above <b>{levels[0]}</b>")
     else:
         lines.append(f"Update: <b>{html.escape(alert_type)}</b>")
 
@@ -180,6 +202,7 @@ def format_start() -> str:
         "Commands:\n"
         "/watch &lt;address&gt; - Scan all markets and watch active positions (max 3 addresses per chat)\n"
         "/rescan &lt;address&gt; - Rescan all markets for an address (max once per 5 min)\n"
+        "/levels [levels|reset] - View or set custom alert levels per chat\n"
         "/list - List monitored addresses and positions\n"
         "/remove &lt;address&gt; - Stop watching an address\n"
         "/privacy - View privacy information\n"
@@ -208,6 +231,7 @@ def format_scan_response(
     found: Sequence[tuple[Any, Any]],
     failed_count: int = 0,
     is_rescan: bool = False,
+    levels: Sequence[Decimal] = DEFAULT_LEVELS,
 ) -> str:
     link = profile_link(address)
     action = "Rescan completed" if is_rescan else "Now watching"
@@ -215,7 +239,7 @@ def format_scan_response(
     if found:
         lines = [f"{action} for {link}. Found {len(found)} position(s):", ""]
         for market, data in found:
-            emoji = hf_emoji(data.hf)
+            emoji = hf_emoji(data.hf, levels=levels)
             m_name = html.escape(format_market_name(market))
             hf_val = format_hf(data.hf)
             gauge = hf_gauge(data.hf)
@@ -249,9 +273,10 @@ def format_new_position(
     hf: Decimal | None,
     collateral_usd: Decimal | None = None,
     debt_usd: Decimal | None = None,
+    levels: Sequence[Decimal] = DEFAULT_LEVELS,
 ) -> str:
     link = profile_link(address)
-    emoji = hf_emoji(hf)
+    emoji = hf_emoji(hf, levels=levels)
     m_name = html.escape(format_market_name(market))
     hf_val = format_hf(hf)
     gauge = hf_gauge(hf)
@@ -312,9 +337,23 @@ def format_invalid_address(msg: str = "") -> str:
     return f"Invalid Ethereum address{detail}. Must be a 0x-prefixed 40-hex address."
 
 
-def format_list(watches: Sequence[Any]) -> str:
+def format_list(watches: Sequence[Any], levels: Sequence[Decimal] = DEFAULT_LEVELS) -> str:
+    lvl_line = f"Levels: {' / '.join(str(lvl) for lvl in levels)}"
+    if tuple(levels) == DEFAULT_LEVELS:
+        lvl_line += " (default)"
+
     if not watches:
-        return "No addresses currently monitored. Use /watch &lt;address&gt; to add one."
+        return f"No addresses currently monitored. Use /watch &lt;address&gt; to add one.\n\n{lvl_line}"
+
+    def _state_or_hf_emoji(val: Any) -> str:
+        if isinstance(val, (int, float, Decimal)):
+            return hf_emoji(val, levels=levels)
+        st = str(val)
+        if st == "ok":
+            return "🟢"
+        if st.startswith("L") and st[1:].isdigit():
+            return level_emoji(int(st[1:]), len(levels))
+        return state_emoji(st)
 
     # Check if grouped: list of (address, list_of_positions)
     first = watches[0]
@@ -330,20 +369,20 @@ def format_list(watches: Sequence[Any]) -> str:
                     if isinstance(item, tuple):
                         if len(item) == 3:
                             m_name, state_or_hf, extra = item
-                            emoji = state_emoji(str(state_or_hf))
+                            emoji = _state_or_hf_emoji(state_or_hf)
                             lines.append(f"{emoji} {m_name}  HF {format_hf(extra)}")
                         elif len(item) == 2:
                             m_name, val = item
+                            emoji = _state_or_hf_emoji(val)
                             if isinstance(val, (int, float, Decimal)):
-                                emoji = hf_emoji(val)
                                 lines.append(f"{emoji} {m_name}  HF {format_hf(val)}")
                             else:
-                                emoji = state_emoji(str(val))
                                 lines.append(f"{emoji} {m_name}")
                         else:
                             lines.append(f"- {item[0]}")
                     else:
                         lines.append(f"- {item}")
+        lines.extend(["", lvl_line])
         return "\n".join(lines)
 
     # Legacy flat format: list of (address, state)
@@ -351,8 +390,43 @@ def format_list(watches: Sequence[Any]) -> str:
     for item in watches:
         if isinstance(item, tuple) and len(item) == 2:
             addr, state = item
-            lines.append(f"{state_emoji(str(state))} {profile_link(addr)}")
+            lines.append(f"{_state_or_hf_emoji(state)} {profile_link(addr)}")
+    lines.extend(["", lvl_line])
     return "\n".join(lines)
+
+
+def format_levels(levels: Sequence[Decimal], is_default: bool) -> str:
+    """Format current alert levels display."""
+    lvl_str = " / ".join(str(lvl) for lvl in levels)
+    suffix = " (default)" if is_default else ""
+    return (
+        f"Alert levels: <b>{lvl_str}</b>{suffix}\n\n"
+        "Use <code>/levels &lt;l1&gt; &lt;l2&gt; ...</code> to change (2 to 5 levels, descending, min gap 0.04).\n"
+        "Use <code>/levels reset</code> to restore default levels."
+    )
+
+
+def format_levels_error(msg: str) -> str:
+    """Format error message for invalid alert levels input."""
+    return f"Invalid alert levels: {html.escape(msg)}\nUse /levels to view requirements."
+
+
+def format_levels_saved(levels: Sequence[Decimal]) -> str:
+    """Format confirmation message after saving custom alert levels."""
+    lvl_str = " / ".join(str(lvl) for lvl in levels)
+    return (
+        f"Alert levels updated to <b>{lvl_str}</b>.\n\n"
+        "Watch states were re-armed. An alert may arrive immediately if a position is currently below a level."
+    )
+
+
+def format_levels_reset() -> str:
+    """Format confirmation message after resetting alert levels to default."""
+    lvl_str = " / ".join(str(lvl) for lvl in DEFAULT_LEVELS)
+    return (
+        f"Alert levels reset to default (<b>{lvl_str}</b>).\n\n"
+        "Watch states were re-armed. An alert may arrive immediately if a position is currently below a level."
+    )
 
 
 def format_remove(address: str, removed: bool) -> str:

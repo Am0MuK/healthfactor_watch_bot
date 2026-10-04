@@ -1,8 +1,10 @@
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+from hfwb.state import DEFAULT_LEVELS
 from hfwb.store import (
     DEFAULT_LEGACY_MARKET_KEY,
     LimitError,
@@ -14,6 +16,7 @@ from hfwb.store import (
     delete_chat,
     distinct_addresses,
     distinct_pairs,
+    get_levels,
     get_table_columns,
     init_db,
     list_tracked_addresses,
@@ -22,6 +25,8 @@ from hfwb.store import (
     record_failure,
     remove_address,
     remove_watch,
+    reset_levels,
+    set_levels,
     update_last_scan_ts,
     update_state,
 )
@@ -77,7 +82,7 @@ def test_migration_from_old_schema(tmp_path: Path):
     conn = sqlite3.connect(str(old_db))
     cur = conn.cursor()
     cur.execute("PRAGMA user_version;")
-    assert cur.fetchone()[0] == 1
+    assert cur.fetchone()[0] == 2
 
     cur.execute("SELECT chat_id, address, market_key, state, last_alert_ts, fail_count FROM watches;")
     rows = cur.fetchall()
@@ -259,3 +264,149 @@ def test_tracked_address_rescan_ts(db_path: Path):
     update_last_scan_ts(db_path, 600, addr, 250.0)
     tracked = list_tracked_addresses(db_path, 600)
     assert tracked[0].last_scan_ts == 250.0
+
+
+def test_schema_user_version_2_and_chat_settings_table(db_path: Path):
+    with sqlite3.connect(str(db_path)) as conn:
+        ver = conn.execute("PRAGMA user_version;").fetchone()[0]
+        assert ver == 2
+
+    cols = get_table_columns(db_path, "chat_settings")
+    forbidden = {"username", "user_name", "first_name", "last_name", "message", "text"}
+    for col in cols:
+        assert col.lower() not in forbidden
+    assert {"chat_id", "levels"}.issubset(set(cols))
+
+
+def test_migration_from_v1_schema(tmp_path: Path):
+    v1_db = tmp_path / "v1_schema.db"
+    conn = sqlite3.connect(str(v1_db))
+    conn.execute(
+        """
+        CREATE TABLE watches (
+            chat_id INTEGER NOT NULL,
+            address TEXT NOT NULL,
+            market_key TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'ok',
+            last_alert_ts REAL,
+            fail_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (chat_id, address, market_key)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE tracked_addresses (
+            chat_id INTEGER NOT NULL,
+            address TEXT NOT NULL,
+            last_scan_ts REAL,
+            PRIMARY KEY (chat_id, address)
+        );
+        """
+    )
+    conn.execute("PRAGMA user_version = 1;")
+    conn.execute(
+        "INSERT INTO watches (chat_id, address, market_key, state, last_alert_ts, fail_count) VALUES (?, ?, ?, ?, ?, ?)",
+        (1001, "0x1111111111111111111111111111111111111111", "m_key_1", "L2", 54321.0, 1),
+    )
+    conn.execute(
+        "INSERT INTO tracked_addresses (chat_id, address, last_scan_ts) VALUES (?, ?, ?)",
+        (1001, "0x1111111111111111111111111111111111111111", 12345.0),
+    )
+    conn.commit()
+    conn.close()
+
+    # Upgrade via init_db
+    init_db(v1_db)
+
+    # Check upgraded version and preserved data
+    conn = sqlite3.connect(str(v1_db))
+    assert conn.execute("PRAGMA user_version;").fetchone()[0] == 2
+    row = conn.execute("SELECT chat_id, address, market_key, state, last_alert_ts, fail_count FROM watches;").fetchone()
+    assert row == (1001, "0x1111111111111111111111111111111111111111", "m_key_1", "L2", 54321.0, 1)
+    t_row = conn.execute("SELECT chat_id, address, last_scan_ts FROM tracked_addresses;").fetchone()
+    assert t_row == (1001, "0x1111111111111111111111111111111111111111", 12345.0)
+    conn.close()
+
+
+def test_get_levels_default_when_no_row(db_path: Path):
+    levels = get_levels(db_path, chat_id=9999)
+    assert levels == DEFAULT_LEVELS
+
+
+def test_set_levels_and_resets_watch_states(db_path: Path):
+    chat_id = 100
+    other_chat = 200
+    addr = "0x1111111111111111111111111111111111111111"
+
+    add_watch(db_path, chat_id, addr, "m1", state="L2")
+    update_state(db_path, chat_id, addr, "m1", "L2", last_alert_ts=12345.0)
+
+    add_watch(db_path, other_chat, addr, "m1", state="L3")
+    update_state(db_path, other_chat, addr, "m1", "L3", last_alert_ts=99999.0)
+
+    custom_levels = (Decimal("1.5"), Decimal("1.3"), Decimal("1.1"))
+    set_levels(db_path, chat_id, custom_levels)
+
+    # Levels saved
+    assert get_levels(db_path, chat_id) == custom_levels
+
+    # Watches for chat_id reset to state ok and last_alert_ts None
+    w = list_watches(db_path, chat_id, addr)[0]
+    assert w.state == "ok"
+    assert w.last_alert_ts is None
+
+    # Other chat unchanged
+    w_other = list_watches(db_path, other_chat, addr)[0]
+    assert w_other.state == "L3"
+    assert w_other.last_alert_ts == 99999.0
+
+
+def test_reset_levels(db_path: Path):
+    chat_id = 300
+    addr = "0x1111111111111111111111111111111111111111"
+    custom_levels = (Decimal("1.6"), Decimal("1.3"))
+
+    set_levels(db_path, chat_id, custom_levels)
+    assert get_levels(db_path, chat_id) == custom_levels
+
+    add_watch(db_path, chat_id, addr, "m1", state="L1")
+    update_state(db_path, chat_id, addr, "m1", "L1", last_alert_ts=12345.0)
+
+    reset_levels(db_path, chat_id)
+
+    # Levels back to default
+    assert get_levels(db_path, chat_id) == DEFAULT_LEVELS
+
+    # Watches reset to ok and last_alert_ts None
+    w = list_watches(db_path, chat_id, addr)[0]
+    assert w.state == "ok"
+    assert w.last_alert_ts is None
+
+
+def test_delete_chat_removes_settings(db_path: Path):
+    chat_id = 400
+    custom_levels = (Decimal("1.6"), Decimal("1.3"))
+    set_levels(db_path, chat_id, custom_levels)
+    assert get_levels(db_path, chat_id) == custom_levels
+
+    delete_chat(db_path, chat_id)
+    assert get_levels(db_path, chat_id) == DEFAULT_LEVELS
+
+
+def test_corrupt_stored_levels_fallback(db_path: Path, caplog):
+    chat_id = 500
+    # Manually insert invalid levels string
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "INSERT INTO chat_settings (chat_id, levels) VALUES (?, ?)",
+            (chat_id, "corrupted,data,abc"),
+        )
+        conn.commit()
+
+    import logging
+    with caplog.at_level(logging.WARNING):
+        levels = get_levels(db_path, chat_id)
+
+    assert levels == DEFAULT_LEVELS
+    assert any("corrupt" in r.getMessage().lower() or "falling back" in r.getMessage().lower() for r in caplog.records)

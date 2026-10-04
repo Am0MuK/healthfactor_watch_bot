@@ -16,6 +16,7 @@ from hfwb.store import (
     init_db,
     list_tracked_addresses,
     list_watches,
+    set_levels,
 )
 from hfwb.telegram import Blocked
 
@@ -359,3 +360,102 @@ def test_rescan_limit_for_one_chat_does_not_block_other_chats(db_path: Path):
     )
     assert [w.market_key for w in list_watches(db_path, 902)] == [M_ETH.key]
     assert any(cid == 902 for cid, _ in tg.sent_messages)
+
+
+def test_poll_once_uses_chat_levels_and_caches_per_cycle(db_path: Path, monkeypatch):
+    import hfwb.runner
+    import hfwb.store
+
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    # Chat 101 has custom levels: 1.8, 1.4
+    set_levels(db_path, 101, (Decimal("1.8"), Decimal("1.4")))
+    # Chat 102 has default levels (1.4, 1.2, 1.1, 1.05)
+    add_watch(db_path, 101, addr, M_ARB.key, state="ok")
+    add_watch(db_path, 102, addr, M_ARB.key, state="ok")
+    # Additional watch for Chat 101 on M_ETH to verify caching
+    add_watch(db_path, 101, addr, M_ETH.key, state="ok")
+
+    def reader(market, address):
+        return AccountData(
+            collateral_usd=Decimal(10000),
+            debt_usd=Decimal(6000),
+            hf=Decimal("1.65"),
+            no_debt=False,
+            has_position=True,
+        )
+
+    tg = FakeTelegramClient()
+    clock = FakeClock(2000.0)
+
+    orig_get_levels = hfwb.store.get_levels
+    call_counts = {101: 0, 102: 0}
+
+    def counting_get_levels(db, chat_id):
+        if chat_id in call_counts:
+            call_counts[chat_id] += 1
+        return orig_get_levels(db, chat_id)
+
+    monkeypatch.setattr(hfwb.runner, "get_levels", counting_get_levels, raising=False)
+    monkeypatch.setattr(hfwb.store, "get_levels", counting_get_levels)
+
+    poll_once(
+        db_path,
+        markets=[M_ARB, M_ETH],
+        tg_client=tg,
+        reader_fn=reader,
+        clock=clock,
+    )
+
+    # Chat 101 received alerts with its custom level (1.8) and emoji 🔴
+    sent_101 = [m for m in tg.sent_messages if m[0] == 101]
+    assert len(sent_101) == 2
+    for _, text in sent_101:
+        assert "below <b>1.8</b>" in text
+        assert "🔴" in text
+
+    # Chat 102 received NO alert (1.65 >= 1.4)
+    sent_102 = [m for m in tg.sent_messages if m[0] == 102]
+    assert len(sent_102) == 0
+
+    # States in DB
+    w_101 = list_watches(db_path, 101)
+    assert all(w.state == "L1" for w in w_101)
+    w_102 = list_watches(db_path, 102)
+    assert all(w.state == "ok" for w in w_102)
+
+    # Verify caching: get_levels called exactly ONCE per chat_id during the cycle
+    assert call_counts[101] == 1
+    assert call_counts[102] == 1
+
+
+def test_rescan_due_addresses_uses_chat_levels(db_path: Path):
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    clock = FakeClock(100000.0)
+    add_tracked_address(db_path, 701, addr, last_scan_ts=clock() - 90000.0)
+    # Chat 701 has custom levels: 1.8, 1.4
+    set_levels(db_path, 701, (Decimal("1.8"), Decimal("1.4")))
+
+    def fake_scanner(address, markets, reader=None):
+        return ScanResult(
+            found=[(M_ETH, AccountData(None, None, Decimal("1.65"), False, True))],
+            failed=[],
+        )
+
+    tg = FakeTelegramClient()
+    rescan_due_addresses(
+        db_path=db_path,
+        tg_client=tg,
+        markets=[M_ETH],
+        scanner_fn=fake_scanner,
+        clock=clock,
+        interval_seconds=86400.0,
+    )
+
+    # Initial state should be L1 (not ok) because 1.65 < 1.8
+    watches = list_watches(db_path, 701)
+    assert len(watches) == 1
+    assert watches[0].state == "L1"
+
+    # Emoji in notification should be 🔴 (level_emoji(1, 2))
+    assert len(tg.sent_messages) == 1
+    assert "🔴 <b>Aave V4 · Ethereum · Main Spoke</b>" in tg.sent_messages[0][1]

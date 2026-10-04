@@ -1,3 +1,4 @@
+import re
 import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
@@ -9,6 +10,10 @@ from hfwb.format import (
     format_delete,
     format_help,
     format_invalid_address,
+    format_levels,
+    format_levels_error,
+    format_levels_reset,
+    format_levels_saved,
     format_list,
     format_market_name,
     format_positions_limit,
@@ -23,15 +28,18 @@ from hfwb.format import (
 )
 from hfwb.markets import Market, get_market, load_markets
 from hfwb.scan import ScanResult, scan_address
-from hfwb.state import step
+from hfwb.state import DEFAULT_LEVELS, step, validate_levels
 from hfwb.store import (
     LimitError,
     add_tracked_address,
     add_watch,
     delete_chat,
+    get_levels,
     list_tracked_addresses,
     list_watches,
     remove_address,
+    reset_levels,
+    set_levels,
     update_last_scan_ts,
 )
 
@@ -107,11 +115,32 @@ class BotHandler:
             count = delete_chat(self.db_path, chat_id)
             return [(chat_id, format_delete(count))]
 
+        if cmd == "/levels":
+            arg_str = text[len(tokens[0]):].strip()
+            if not arg_str:
+                current_levels = get_levels(self.db_path, chat_id)
+                is_default = (current_levels == DEFAULT_LEVELS)
+                return [(chat_id, format_levels(current_levels, is_default))]
+
+            if arg_str.lower() == "reset":
+                reset_levels(self.db_path, chat_id)
+                return [(chat_id, format_levels_reset())]
+
+            raw_tokens = [tok for tok in re.split(r"[\s,]+", arg_str) if tok]
+            try:
+                new_levels = validate_levels(raw_tokens)
+            except ValueError as exc:
+                return [(chat_id, format_levels_error(str(exc)))]
+
+            set_levels(self.db_path, chat_id, new_levels)
+            return [(chat_id, format_levels_saved(new_levels))]
+
         if cmd == "/list":
+            chat_levels = get_levels(self.db_path, chat_id)
             tracked = list_tracked_addresses(self.db_path, chat_id)
             watches = list_watches(self.db_path, chat_id)
             if not tracked and not watches:
-                return [(chat_id, format_list([]))]
+                return [(chat_id, format_list([], levels=chat_levels))]
 
             watches_by_addr: dict[str, list[tuple[str, str]]] = defaultdict(list)
             for w in watches:
@@ -129,7 +158,7 @@ class BotHandler:
                 if addr not in seen_addrs:
                     grouped.append((addr, w_list))
 
-            return [(chat_id, format_list(grouped))]
+            return [(chat_id, format_list(grouped, levels=chat_levels))]
 
         if cmd == "/remove":
             if len(tokens) < 2:
@@ -165,9 +194,10 @@ class BotHandler:
 
             scan_res = self.scanner_fn(norm_addr, self.markets, reader=self.aave_reader)
 
+            chat_levels = get_levels(self.db_path, chat_id)
             limit_hit = False
             for market, acct in scan_res.found:
-                initial_state, _ = step("ok", acct.hf, now_ts=now, last_alert_ts=None)
+                initial_state, _ = step("ok", acct.hf, now_ts=now, last_alert_ts=None, levels=chat_levels)
                 try:
                     add_watch(self.db_path, chat_id, norm_addr, market.key, state=initial_state)
                 except LimitError:
@@ -178,7 +208,13 @@ class BotHandler:
             if not scan_res.failed:
                 update_last_scan_ts(self.db_path, chat_id, norm_addr, now)
 
-            text = format_scan_response(norm_addr, scan_res.found, len(scan_res.failed), is_rescan=is_rescan)
+            text = format_scan_response(
+                norm_addr,
+                scan_res.found,
+                len(scan_res.failed),
+                is_rescan=is_rescan,
+                levels=chat_levels,
+            )
             if limit_hit:
                 text += "\n\n" + format_positions_limit()
             return [(chat_id, text)]
