@@ -655,6 +655,8 @@ def run_all(
     tick_seconds: float = DEFAULT_TICK_SECONDS,
     poll_interval: float | None = None,
     poll_timeout: int = 50,
+    donate_address: str | None = None,
+    donate_note: str | None = None,
 ) -> None:
     """Run poll loop, daily rescan loop, depeg loop, and command loop with graceful shutdown."""
     stop_event = threading.Event()
@@ -668,7 +670,13 @@ def run_all(
     signal.signal(signal.SIGINT, _sig_handler)
 
     all_markets = list(markets) if markets is not None else load_markets()
-    bot_handler = BotHandler(db_path=db_path, markets=all_markets, rpc_urls=rpc_urls or ())
+    bot_handler = BotHandler(
+        db_path=db_path,
+        markets=all_markets,
+        rpc_urls=rpc_urls or (),
+        donate_address=donate_address,
+        donate_note=donate_note,
+    )
 
     effective_tick = poll_interval if poll_interval is not None else tick_seconds
 

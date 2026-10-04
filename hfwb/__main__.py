@@ -9,7 +9,7 @@ from hfwb.aave import read_market
 from hfwb.config import ConfigError, get_db_path, load_config
 from hfwb.markets import load_markets
 from hfwb.runner import run_all
-from hfwb.store import PRO_FEATURES, get_stats, init_db
+from hfwb.store import get_stats, init_db
 from hfwb.telegram import TelegramClient, TelegramError
 
 logger = logging.getLogger("hfwb")
@@ -44,17 +44,12 @@ def verify_markets() -> int:
 
 
 def print_stats(db_path: Path | str) -> int:
-    """Print anonymous usage and interest statistics from the database only."""
+    """Print anonymous usage statistics from the database only."""
     stats = get_stats(db_path)
-    pro = stats["pro_interest"]
     print(f"Chats with tracked addresses: {stats['chats_with_tracked_addresses']}")
     print(f"Watches: {stats['watches']}")
     print(f"Depeg alerts: {stats['depeg_subs']}")
     print(f"Custom levels chats: {stats['custom_levels_chats']}")
-    print("Pro interest:")
-    print(f"  total: {pro['total']}")
-    for f in PRO_FEATURES:
-        print(f"  {f}: {pro.get(f, 0)}")
     return 0
 
 
@@ -103,6 +98,10 @@ def main(argv: list[str] | None = None) -> int:
             me = tg_client.get_me()
             username = me.get("username", "<unknown>")
             print(f"Bot username: @{username}")
+            if config.donate_address:
+                print("Donations: configured")
+            else:
+                print("Donations: not configured")
             return 0
         except (TelegramError, httpx.HTTPError, OSError) as exc:
             sys.stderr.write(f"Connection check failed: {exc}\n")
@@ -123,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
         markets=all_markets,
         rpc_urls=config.rpc_urls,
         heartbeat_file=config.heartbeat_file,
+        donate_address=config.donate_address,
+        donate_note=config.donate_note,
     )
     return 0
 

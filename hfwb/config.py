@@ -1,6 +1,11 @@
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+from hfwb.aave import checksum_address
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_ENV_FILE = ".env"
 DEFAULT_DB_PATH = "/data/services/healthfactor_watch_bot/bot.db"
@@ -18,6 +23,8 @@ class Config:
     rpc_urls: list[str]
     db_path: Path
     heartbeat_file: Path
+    donate_address: str | None = None
+    donate_note: str | None = None
     poll_interval: float = DEFAULT_POLL_INTERVAL
 
 
@@ -82,10 +89,28 @@ def load_config(env_file: Path | str | None = None) -> Config:
     if rpc_fallback:
         rpc_urls.append(rpc_fallback)
 
+    raw_donate_addr = merged_env.get("DONATE_ADDRESS", "").strip()
+    donate_address: str | None = None
+    if raw_donate_addr:
+        try:
+            donate_address = checksum_address(raw_donate_addr)
+        except ValueError:
+            logger.warning("Invalid DONATE_ADDRESS configured; treating as not configured")
+            donate_address = None
+
+    raw_donate_note = merged_env.get("DONATE_NOTE", "").strip()
+    donate_note: str | None = None
+    if raw_donate_note and len(raw_donate_note) <= 80:
+        donate_note = raw_donate_note
+    else:
+        donate_note = None
+
     return Config(
         telegram_bot_token=token,
         rpc_urls=rpc_urls,
         db_path=Path(db_str),
         heartbeat_file=Path(heartbeat_str),
+        donate_address=donate_address,
+        donate_note=donate_note,
         poll_interval=DEFAULT_POLL_INTERVAL,
     )

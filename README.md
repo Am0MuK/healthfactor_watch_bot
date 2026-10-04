@@ -20,8 +20,8 @@ A Telegram bot that monitors Aave V3 (20 EVM chains) and Aave V4 (19 spokes acro
 - `/rescan <address>` - Scan all supported markets on demand to detect new positions (rate limit: once per 5 minutes per chat).
 - `/levels [levels|reset]` - View or configure custom alert levels for this chat (e.g. `/levels 1.5 1.3 1.15 1.05` or `/levels reset`).
 - `/depeg [on|off [symbols...]]` - View status or configure opt-in stablecoin depeg alerts (e.g. `/depeg on` for all 12 tokens, `/depeg on USDC USDT`, or `/depeg off`).
+- `/donate` - View voluntary donation address and network info.
 - `/list` - Display all monitored addresses grouped with their active market positions and alert states.
-- `/pro [yes|no [features...]]` - View ideas and express interest in future options (e.g. `/pro`, `/pro yes addresses faster`, or `/pro no`).
 - `/remove <address>` - Stop monitoring an address and all its market positions.
 - `/privacy` - View privacy notice and data retention terms.
 - `/delete` - Permanently remove all data and watches for this chat.
@@ -221,22 +221,15 @@ The failure streak resets to 0 immediately upon the next successful read.
 
 A background worker checks tracked addresses once every 24 hours. When an address opens a position in a new market, the bot automatically adds a watch for that market and notifies the chat (`Found a new position: ...`).
 
-## Paid Plan Interest (`/pro`)
+## Donations
 
-The bot is free for up to 3 addresses per chat. Before considering extra options, `/pro` measures whether anyone wants more.
+The bot is free and open source. If it is useful to you, you can support it with a voluntary donation via the `/donate` command. Donations grant no extra features or guarantees.
 
-Nothing can be bought. It records only an optional closed list of feature ideas that a chat would use:
-- `addresses`: more than 3 addresses
-- `faster`: more frequent reads
-- `levels`: alert levels per address
-- `email`: e-mail alerts
-- `discord`: Discord alerts
+Donation settings are optional and configured by the operator via environment variables:
+- `DONATE_ADDRESS`: Ethereum address (0x-prefixed, 40 hex characters) displayed to users.
+- `DONATE_NOTE`: Short optional note (max 80 characters, e.g. "USDC on Base").
 
-Commands:
-- `/pro` - View ideas and your current answer.
-- `/pro yes` - Express interest (no preference).
-- `/pro yes addresses faster` - Express interest in specific features.
-- `/pro no` - Remove your answer.
+The public repository contains no donation address, and the bot stores nothing when `/donate` is invoked.
 
 ### Usage Statistics (`--stats`)
 
@@ -244,11 +237,11 @@ Aggregate statistics can be printed directly from the database without starting 
 ```bash
 .venv/bin/hfwb --stats
 ```
-This prints the number of chats with tracked addresses, watches, depeg alerts, custom levels chats, and interest counts (total and per feature). No chat IDs or wallet addresses are output.
+This prints the number of chats with tracked addresses, watches, depeg alerts, and custom levels chats. No chat IDs or wallet addresses are output.
 
 ## Privacy
 
-- The database stores only `chat_id`, monitored `address`, `market_key`, alert `state`, `last_alert_ts`, `fail_count`, `last_scan_ts`, subscribed stablecoin symbols, and optional feature interest from `/pro`.
+- The database stores only `chat_id`, monitored `address`, `market_key`, alert `state`, `last_alert_ts`, `fail_count`, `last_scan_ts`, and subscribed stablecoin symbols.
 - No user names, handles, or message contents are recorded.
 - Retention is strictly "until `/remove` or `/delete`".
 - If Telegram reports HTTP 403 ("bot was blocked by the user"), all rows for that chat are automatically deleted.
@@ -262,6 +255,8 @@ Configuration is loaded from the file specified in `HFWB_ENV_FILE` (default: `.e
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot API token | Yes |
 | `HFWB_DB` | Path to SQLite database (default: `/data/services/healthfactor_watch_bot/bot.db`) | No |
 | `HFWB_HEARTBEAT` | Heartbeat timestamp file path (default: `/data/services/healthfactor_watch_bot/heartbeat`) | No |
+| `DONATE_ADDRESS` | Optional Ethereum address for voluntary donations | No |
+| `DONATE_NOTE` | Optional note displayed with donation address (max 80 chars) | No |
 
 Secrets are never printed in exception messages, CLI outputs, or application logs.
 
@@ -279,7 +274,7 @@ Secrets are never printed in exception messages, CLI outputs, or application log
    ```bash
    .venv/bin/hfwb --check
    ```
-   This reaches the Telegram `getMe` endpoint and prints only the bot username.
+   This reaches the Telegram `getMe` endpoint and prints only the bot username and donation configuration status.
 
 3. Live verification of all market endpoints:
    ```bash
@@ -287,7 +282,7 @@ Secrets are never printed in exception messages, CLI outputs, or application log
    ```
    Tests an `eth_call` on `0x000000000000000000000000000000000000dEaD` for every market and prints status without printing RPC URLs or keys.
 
-4. Inspect database statistics and feature interest:
+4. Inspect database statistics:
    ```bash
    .venv/bin/hfwb --stats
    ```

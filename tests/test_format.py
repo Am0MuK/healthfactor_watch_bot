@@ -13,6 +13,7 @@ from hfwb.format import (
     format_depeg_off,
     format_depeg_on,
     format_depeg_status,
+    format_donate,
     format_help,
     format_levels,
     format_levels_error,
@@ -22,10 +23,6 @@ from hfwb.format import (
     format_market_name,
     format_new_position,
     format_privacy,
-    format_pro_cleared,
-    format_pro_error,
-    format_pro_info,
-    format_pro_saved,
     format_rate_limit,
     format_remove,
     format_rescan_rate_limit,
@@ -650,7 +647,7 @@ def test_privacy_and_help_include_depeg():
     assert_no_forbidden_words(hlp)
 
 
-PLAN7_FORBIDDEN_WORDS = [
+PLAN8_FORBIDDEN_WORDS = [
     "buy",
     "sell",
     "deposit",
@@ -660,7 +657,6 @@ PLAN7_FORBIDDEN_WORDS = [
     "you need to",
     "act now",
     "price",
-    "pay",
     "payment",
     "subscribe",
     "subscription",
@@ -670,14 +666,9 @@ PLAN7_FORBIDDEN_WORDS = [
 ]
 
 
-def assert_no_plan7_forbidden_words(text: str, allow_no_way_to_pay_yet: bool = False) -> None:
+def assert_no_plan8_forbidden_words(text: str) -> None:
     text_lower = text.lower()
-    if allow_no_way_to_pay_yet:
-        assert text_lower.count("no way to pay yet") == 1, (
-            f"Expected 'no way to pay yet' exactly once in:\n{text}"
-        )
-        text_lower = text_lower.replace("no way to pay yet", "")
-    for word in PLAN7_FORBIDDEN_WORDS:
+    for word in PLAN8_FORBIDDEN_WORDS:
         if " " in word:
             assert word not in text_lower, f"Forbidden phrase '{word}' found in message:\n{text}"
         else:
@@ -687,90 +678,81 @@ def assert_no_plan7_forbidden_words(text: str, allow_no_way_to_pay_yet: bool = F
             )
 
 
-def test_format_pro_info_no_current():
-    msg = format_pro_info(None)
-    assert "Ideas for a paid plan. Nothing is charged and there is no way to pay yet." in msg
-    assert "The bot stays free for up to 3 addresses per chat." in msg
-    assert "addresses (more than 3), faster (more frequent reads), levels (alert levels per address), email, discord." in msg
-    assert "Example: /pro yes addresses faster." in msg
-    assert "/pro no removes your answer." in msg
-    assert "Your current answer" not in msg
+def assert_no_plan7_forbidden_words(text: str, allow_no_way_to_pay_yet: bool = False) -> None:
+    assert_no_plan8_forbidden_words(text)
 
 
-def test_format_pro_info_with_current():
-    msg_any = format_pro_info(("any",))
-    assert "Your current answer: <b>any</b>." in msg_any
-
-    msg_feat = format_pro_info(("addresses", "faster"))
-    assert "Your current answer: <b>addresses, faster</b>." in msg_feat
+def test_format_donate_not_configured():
+    assert format_donate(None) == "Donations are not set up for this bot."
+    assert format_donate("") == "Donations are not set up for this bot."
 
 
-def test_format_pro_saved():
-    msg_any = format_pro_saved([])
-    assert "Saved your interest: <b>any</b>." in msg_any
-
-    msg_feat = format_pro_saved(["addresses", "faster"])
-    assert "Saved your interest: <b>addresses, faster</b>." in msg_feat
-
-
-def test_format_pro_cleared():
-    msg = format_pro_cleared()
-    assert "Removed your answer." in msg
+def test_format_donate_configured_no_note():
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    msg = format_donate(addr)
+    assert "This bot is free and open source. If it is useful to you, you can support it with a donation. It is voluntary and gives no extra features or guarantees." in msg
+    assert "Address (tap to copy):" in msg
+    assert f"<code>{addr}</code>" in msg
+    assert msg.strip().endswith("Please check the network before you send.")
+    assert "Network and token:" not in msg
 
 
-def test_format_pro_error():
-    err = format_pro_error("foo")
-    assert "foo" in err
-    assert "addresses, faster, levels, email, discord" in err
+def test_format_donate_configured_with_note():
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    note = "USDC on Base"
+    msg = format_donate(addr, note)
+    assert "Network and token: USDC on Base" in msg
+    assert f"<code>{addr}</code>" in msg
+    assert msg.strip().endswith("Please check the network before you send.")
 
 
-def test_format_watch_limit_hint():
+def test_format_donate_note_html_escaping():
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    note = "USDC & USDT <Base>"
+    msg = format_donate(addr, note)
+    assert "Network and token: USDC &amp; USDT &lt;Base&gt;" in msg
+    assert "<Base>" not in msg
+
+
+def test_format_watch_limit_original():
     msg = format_watch_limit()
-    assert "Need more? See /pro." in msg
+    assert "/pro" not in msg
+    assert "Need more" not in msg
+    assert msg == "Limit reached: maximum 3 addresses per chat. Use /remove &lt;address&gt; or /delete."
 
 
-def test_start_help_privacy_include_pro():
+def test_start_help_privacy_include_donate_no_pro():
     start = format_start()
-    assert "/pro" in start
+    assert "/donate" in start
+    assert "/pro" not in start
 
     help_text = format_help()
-    assert "/pro" in help_text
+    assert "/donate" in help_text
+    assert "/pro" not in help_text
 
     priv = format_privacy()
-    assert "/pro" in priv
+    assert "/pro" not in priv
 
 
 def test_forbidden_words_on_all_new_texts():
-    samples_with_pay_exception = [
-        format_pro_info(None),
-        format_pro_info(("any",)),
-        format_pro_info(("addresses", "faster")),
-    ]
-    for s in samples_with_pay_exception:
-        assert_no_plan7_forbidden_words(s, allow_no_way_to_pay_yet=True)
-
-    other_samples = [
-        format_pro_saved([]),
-        format_pro_saved(["any"]),
-        format_pro_saved(["addresses", "faster", "levels", "email", "discord"]),
-        format_pro_cleared(),
-        format_pro_error("unknown_feature"),
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    samples = [
+        format_donate(None),
+        format_donate(addr),
+        format_donate(addr, "USDC on Base"),
         format_watch_limit(),
         format_start(),
         format_help(),
         format_privacy(),
     ]
-    for s in other_samples:
-        assert_no_plan7_forbidden_words(s, allow_no_way_to_pay_yet=False)
+    for s in samples:
+        assert_no_plan8_forbidden_words(s)
 
 
-def test_readme_pro_section_forbidden_words():
+def test_readme_has_no_pro_or_paid_plan():
     readme_text = Path("README.md").read_text(encoding="utf-8")
-    assert "## Paid Plan Interest (`/pro`)" in readme_text
-    section = readme_text.split("## Paid Plan Interest (`/pro`)")[1].split("## Privacy")[0]
-    assert_no_plan7_forbidden_words(section, allow_no_way_to_pay_yet=False)
-    for extra in ["payment", "price", "promise"]:
-        assert extra not in section.lower()
+    assert "/pro" not in readme_text.lower()
+    assert "paid plan" not in readme_text.lower()
 
 
 

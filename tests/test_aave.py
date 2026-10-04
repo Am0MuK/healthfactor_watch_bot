@@ -302,3 +302,28 @@ def test_read_market_short_result():
     transport_v4 = httpx.MockTransport(lambda r: httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": short_v4}))
     with pytest.raises(ReadError, match="short result"):
         read_market(DUMMY_V4_MARKET, "0x000000000000000000000000000000000000dead", client=httpx.Client(transport=transport_v4))
+
+
+def test_checksum_address_matches_the_official_eip55_vectors():
+    from hfwb.aave import checksum_address
+
+    vectors = [
+        "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+        "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359",
+        "0xdbF03B407c01E7cD3CBea99509d93f8DDDC8C6FB",
+        "0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb",
+    ]
+    for v in vectors:
+        assert checksum_address(v.lower()) == v
+        assert checksum_address(v) == v  # already checksummed input is accepted and unchanged
+    assert checksum_address("0xf903f91565da30b90b57b259fafd3705e667be1a") == "0xf903f91565dA30B90B57B259fAfd3705E667be1A"
+
+
+def test_checksum_address_rejects_invalid_input():
+    import pytest
+
+    from hfwb.aave import checksum_address
+
+    for bad in ["0x123", "hello", "0x" + "g" * 40, "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD"]:  # last: bad checksum
+        with pytest.raises(ValueError):
+            checksum_address(bad)

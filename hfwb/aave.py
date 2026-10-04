@@ -119,6 +119,13 @@ def normalize_address(address: str) -> str:
     return "0x" + hex_part.lower()
 
 
+def checksum_address(address: str) -> str:
+    """Return the EIP-55 mixed-case form of a valid address (raises ValueError on invalid input)."""
+    lowered = normalize_address(address)  # validates format and, for mixed case, the checksum
+    digest = _keccak_256(lowered[2:].encode("ascii")).hex()
+    return "0x" + "".join(c.upper() if int(digest[i], 16) >= 8 else c for i, c in enumerate(lowered[2:]))
+
+
 def read_market(
     market: "Market",
     address: str,

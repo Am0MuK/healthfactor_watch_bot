@@ -526,102 +526,7 @@ def test_depeg_delete_wipes_subs(db_path: Path):
     assert len(list_depeg_subs(db_path, 123)) == 0
 
 
-def test_pro_command_no_arg(db_path: Path):
-    from hfwb.store import set_pro_interest
-    handler = BotHandler(db_path, markets=[M_ARB])
-
-    # No argument when no answer set
-    res1 = handler.handle({"message": {"chat": {"id": 123}, "text": "/pro"}})
-    assert len(res1) == 1
-    assert "Ideas for a paid plan." in res1[0][1]
-    assert "no way to pay yet" in res1[0][1]
-    assert "Your current answer" not in res1[0][1]
-
-    # Set answer and view /pro again
-    set_pro_interest(db_path, 123, ["addresses", "faster"], 1000.0)
-    res2 = handler.handle({"message": {"chat": {"id": 123}, "text": "/pro"}})
-    assert len(res2) == 1
-    assert "Ideas for a paid plan." in res2[0][1]
-    assert "Your current answer: <b>addresses, faster</b>." in res2[0][1]
-
-
-def test_pro_command_yes_no_features(db_path: Path):
-    from hfwb.store import get_pro_interest
-    handler = BotHandler(db_path, markets=[M_ARB])
-    res = handler.handle({"message": {"chat": {"id": 123}, "text": "/pro yes"}})
-    assert len(res) == 1
-    assert "Saved your interest: <b>any</b>." in res[0][1]
-    assert get_pro_interest(db_path, 123) == ("any",)
-
-
-def test_pro_command_yes_with_features(db_path: Path):
-    from hfwb.store import get_pro_interest
-    handler = BotHandler(db_path, markets=[M_ARB])
-    res = handler.handle({"message": {"chat": {"id": 123}, "text": "/pro yes addresses faster"}})
-    assert len(res) == 1
-    assert "Saved your interest: <b>addresses, faster</b>." in res[0][1]
-    assert get_pro_interest(db_path, 123) == ("addresses", "faster")
-
-
-def test_pro_command_yes_mixed_case_and_commas(db_path: Path):
-    from hfwb.store import get_pro_interest
-    handler = BotHandler(db_path, markets=[M_ARB])
-    res = handler.handle({"message": {"chat": {"id": 123}, "text": "/pro yes ADDRESSES,  faster"}})
-    assert len(res) == 1
-    assert "Saved your interest: <b>addresses, faster</b>." in res[0][1]
-    assert get_pro_interest(db_path, 123) == ("addresses", "faster")
-
-
-def test_pro_command_yes_duplicates_ignored(db_path: Path):
-    from hfwb.store import get_pro_interest
-    handler = BotHandler(db_path, markets=[M_ARB])
-    res = handler.handle({"message": {"chat": {"id": 123}, "text": "/pro yes faster, addresses, faster"}})
-    assert len(res) == 1
-    assert "Saved your interest: <b>faster, addresses</b>." in res[0][1]
-    assert get_pro_interest(db_path, 123) == ("faster", "addresses")
-
-
-def test_pro_command_unknown_feature(db_path: Path):
-    from hfwb.store import get_pro_interest
-    handler = BotHandler(db_path, markets=[M_ARB])
-    res = handler.handle({"message": {"chat": {"id": 123}, "text": "/pro yes addresses unknown_feature"}})
-    assert len(res) == 1
-    assert "Unknown feature: <b>unknown_feature</b>." in res[0][1]
-    assert "Valid features:" in res[0][1]
-    assert get_pro_interest(db_path, 123) is None
-
-    # Invalid subcommand
-    res2 = handler.handle({"message": {"chat": {"id": 123}, "text": "/pro foobar"}})
-    assert len(res2) == 1
-    assert "Unknown feature: <b>foobar</b>." in res2[0][1]
-
-
-def test_pro_command_no_clears(db_path: Path):
-    from hfwb.store import get_pro_interest, set_pro_interest
-    handler = BotHandler(db_path, markets=[M_ARB])
-    set_pro_interest(db_path, 123, ["addresses"], 1000.0)
-    assert get_pro_interest(db_path, 123) == ("addresses",)
-
-    res = handler.handle({"message": {"chat": {"id": 123}, "text": "/pro no"}})
-    assert len(res) == 1
-    assert "Removed your answer." in res[0][1]
-    assert get_pro_interest(db_path, 123) is None
-
-
-def test_pro_command_rate_limit(db_path: Path):
-    clock = FakeClock(1000.0)
-    handler = BotHandler(db_path, markets=[M_ARB], clock=clock)
-
-    for _ in range(10):
-        res = handler.handle({"message": {"chat": {"id": 123}, "text": "/pro"}})
-        assert "Ideas for a paid plan." in res[0][1]
-
-    # 11th is rate limited
-    res = handler.handle({"message": {"chat": {"id": 123}, "text": "/pro"}})
-    assert "Rate limit exceeded" in res[0][1]
-
-
-def test_watch_limit_includes_pro_hint(db_path: Path):
+def test_watch_limit_back_to_original(db_path: Path):
     def fake_scanner(address, markets, reader=None):
         return ScanResult(found=[], failed=[])
 
@@ -634,28 +539,66 @@ def test_watch_limit_includes_pro_hint(db_path: Path):
     for a in addrs:
         handler.handle({"message": {"chat": {"id": 123}, "text": f"/watch {a}"}})
 
-    # 4th watch hits limit and includes hint
+    # 4th watch hits limit and does NOT include /pro hint
     res = handler.handle(
         {"message": {"chat": {"id": 123}, "text": "/watch 0x4444444444444444444444444444444444444444"}}
     )
-    assert "Need more? See /pro." in res[0][1]
+    assert "/pro" not in res[0][1]
+    assert "Need more" not in res[0][1]
+    assert "Limit reached: maximum 3 addresses per chat" in res[0][1]
 
 
-def test_delete_command_wipes_pro_interest(db_path: Path):
-    from hfwb.store import get_pro_interest, set_pro_interest
+def test_pro_command_is_unknown(db_path: Path):
     handler = BotHandler(db_path, markets=[M_ARB])
-    set_pro_interest(db_path, 123, ["addresses"], 1000.0)
-    assert get_pro_interest(db_path, 123) == ("addresses",)
-
-    res = handler.handle({"message": {"chat": {"id": 123}, "text": "/delete"}})
-    assert "Deleted all data" in res[0][1]
-    assert get_pro_interest(db_path, 123) is None
-
+    for text in ["/pro", "/pro yes", "/pro no", "/pro addresses"]:
+        res = handler.handle({"message": {"chat": {"id": 123}, "text": text}})
+        assert len(res) == 1
+        assert "Unknown command" in res[0][1]
+        assert "/help" in res[0][1]
 
 
+def test_donate_command_configured(db_path: Path):
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    note = "USDC on Base"
+    handler = BotHandler(db_path, markets=[M_ARB], donate_address=addr, donate_note=note)
+    res = handler.handle({"message": {"chat": {"id": 123}, "text": "/donate"}})
+    assert len(res) == 1
+    reply = res[0][1]
+    assert "This bot is free and open source. If it is useful to you, you can support it with a donation. It is voluntary and gives no extra features or guarantees." in reply
+    assert "Network and token: USDC on Base" in reply
+    assert "Address (tap to copy):" in reply
+    assert f"<code>{addr}</code>" in reply
+    assert reply.strip().endswith("Please check the network before you send.")
 
-def test_pro_unknown_feature_echo_is_truncated(db_path: Path):
-    handler = BotHandler(db_path, markets=[])
-    res = handler.handle({"message": {"chat": {"id": 8801}, "text": "/pro yes " + "x" * 400}})
-    assert len(res[0][1]) < 300
-    assert "Valid features" in res[0][1]
+
+def test_donate_command_not_configured(db_path: Path):
+    handler = BotHandler(db_path, markets=[M_ARB])
+    res = handler.handle({"message": {"chat": {"id": 123}, "text": "/donate"}})
+    assert len(res) == 1
+    assert res[0][1] == "Donations are not set up for this bot."
+
+
+def test_donate_command_rate_limit(db_path: Path):
+    clock = FakeClock(1000.0)
+    handler = BotHandler(db_path, markets=[M_ARB], clock=clock)
+
+    for _ in range(10):
+        res = handler.handle({"message": {"chat": {"id": 123}, "text": "/donate"}})
+        assert "Donations are not set up for this bot." in res[0][1]
+
+    # 11th is rate limited
+    res = handler.handle({"message": {"chat": {"id": 123}, "text": "/donate"}})
+    assert "Rate limit exceeded" in res[0][1]
+
+
+def test_donate_command_stores_nothing(db_path: Path):
+    import sqlite3
+    addr = "0x794a61358d6845594f94dc1db02a252b5b4814ad"
+    handler = BotHandler(db_path, markets=[M_ARB], donate_address=addr)
+    handler.handle({"message": {"chat": {"id": 123}, "text": "/donate"}})
+
+    with sqlite3.connect(str(db_path)) as conn:
+        cur = conn.cursor()
+        for tbl in ["watches", "tracked_addresses", "chat_settings", "depeg_subs"]:
+            cur.execute(f"SELECT COUNT(*) FROM {tbl};")
+            assert cur.fetchone()[0] == 0

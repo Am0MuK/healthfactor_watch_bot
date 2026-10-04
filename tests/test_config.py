@@ -144,12 +144,155 @@ def test_cli_verify_markets_flag_failure(monkeypatch, capsys):
     assert "SECRET_API_KEY" not in captured.err
 
 
+def test_load_config_optional_donations_absent(tmp_path: Path):
+    env_file = tmp_path / "test.env"
+    env_file.write_text(
+        "TELEGRAM_BOT_TOKEN=test_token_123\n"
+        "RPC_URL=https://arb.rpc.test\n"
+    )
+    cfg = load_config(env_file=env_file)
+    assert cfg.donate_address is None
+    assert cfg.donate_note is None
+
+
+def test_load_config_donations_valid(tmp_path: Path):
+    env_file = tmp_path / "test.env"
+    env_file.write_text(
+        "TELEGRAM_BOT_TOKEN=test_token_123\n"
+        "RPC_URL=https://arb.rpc.test\n"
+        "DONATE_ADDRESS=0x794a61358D6845594F94dc1DB02A252b5b4814aD\n"
+        "DONATE_NOTE=USDC on Base\n"
+    )
+    cfg = load_config(env_file=env_file)
+    assert cfg.donate_address == "0x794a61358D6845594F94dc1DB02A252b5b4814aD"  # EIP-55 form is kept for display
+    assert cfg.donate_note == "USDC on Base"
+
+
+def test_load_config_donations_invalid_address(tmp_path: Path, caplog):
+    import logging
+
+    bad_addresses = [
+        "794a61358d6845594f94dc1db02a252b5b4814ad",  # missing 0x
+        "0x1234",  # too short
+        "0x794a61358d6845594f94dc1db02a252b5b4814zz",  # non-hex
+        "0x794A61358D6845594F94dc1DB02A252b5b4814aD",  # invalid checksum (one letter bad case)
+    ]
+
+    for bad in bad_addresses:
+        caplog.clear()
+        env_file = tmp_path / f"test_{hash(bad)}.env"
+        env_file.write_text(
+            "TELEGRAM_BOT_TOKEN=test_token_123\n"
+            "RPC_URL=https://arb.rpc.test\n"
+            f"DONATE_ADDRESS={bad}\n"
+        )
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(env_file=env_file)
+        assert cfg.donate_address is None
+        # Warning was logged
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+        # Warning must NOT contain the invalid address value
+        for r in caplog.records:
+            assert bad not in r.message
+
+
+def test_load_config_donate_note_validation(tmp_path: Path):
+    # Note exactly 80 chars
+    note_80 = "A" * 80
+    env_file = tmp_path / "note80.env"
+    env_file.write_text(
+        "TELEGRAM_BOT_TOKEN=test_token_123\n"
+        "RPC_URL=https://arb.rpc.test\n"
+        f"DONATE_NOTE={note_80}\n"
+    )
+    cfg = load_config(env_file=env_file)
+    assert cfg.donate_note == note_80
+
+    # Note 81 chars (treated as absent)
+    note_81 = "A" * 81
+    env_file2 = tmp_path / "note81.env"
+    env_file2.write_text(
+        "TELEGRAM_BOT_TOKEN=test_token_123\n"
+        "RPC_URL=https://arb.rpc.test\n"
+        f"DONATE_NOTE={note_81}\n"
+    )
+    cfg2 = load_config(env_file=env_file2)
+    assert cfg2.donate_note is None
+
+    # Empty note or whitespace only (treated as absent)
+    env_file3 = tmp_path / "note_empty.env"
+    env_file3.write_text(
+        "TELEGRAM_BOT_TOKEN=test_token_123\n"
+        "RPC_URL=https://arb.rpc.test\n"
+        "DONATE_NOTE=   \n"
+    )
+    cfg3 = load_config(env_file=env_file3)
+    assert cfg3.donate_note is None
+
+
+def test_cli_check_donations(tmp_path: Path, monkeypatch, capsys):
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"ok": True, "result": {"id": 1, "is_bot": True, "username": "healthfactor_test_bot"}},
+        )
+
+    transport = httpx.MockTransport(mock_handler)
+    mock_client = httpx.Client(transport=transport)
+
+    # 1. Not configured
+    env_not_conf = tmp_path / "check_not_conf.env"
+    env_not_conf.write_text(
+        "TELEGRAM_BOT_TOKEN=token_abc_123\n"
+        "RPC_URL=https://arb.rpc.test\n"
+    )
+    monkeypatch.setenv("HFWB_ENV_FILE", str(env_not_conf))
+    with monkeypatch.context() as m:
+        m.setattr("hfwb.__main__.get_http_client", lambda: mock_client)
+        assert main(["--check"]) == 0
+    captured = capsys.readouterr()
+    assert "Donations: not configured" in captured.out
+
+    # 2. Configured
+    valid_addr = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
+    env_conf = tmp_path / "check_conf.env"
+    env_conf.write_text(
+        "TELEGRAM_BOT_TOKEN=token_abc_123\n"
+        "RPC_URL=https://arb.rpc.test\n"
+        f"DONATE_ADDRESS={valid_addr}\n"
+    )
+    monkeypatch.setenv("HFWB_ENV_FILE", str(env_conf))
+    with monkeypatch.context() as m:
+        m.setattr("hfwb.__main__.get_http_client", lambda: mock_client)
+        assert main(["--check"]) == 0
+    captured = capsys.readouterr()
+    assert "Donations: configured" in captured.out
+    assert valid_addr not in captured.out
+    assert valid_addr.lower() not in captured.out
+
+    # 3. Invalid address -> not configured, never prints address
+    bad_addr = "0x1234bad"
+    env_bad = tmp_path / "check_bad.env"
+    env_bad.write_text(
+        "TELEGRAM_BOT_TOKEN=token_abc_123\n"
+        "RPC_URL=https://arb.rpc.test\n"
+        f"DONATE_ADDRESS={bad_addr}\n"
+    )
+    monkeypatch.setenv("HFWB_ENV_FILE", str(env_bad))
+    with monkeypatch.context() as m:
+        m.setattr("hfwb.__main__.get_http_client", lambda: mock_client)
+        assert main(["--check"]) == 0
+    captured = capsys.readouterr()
+    assert "Donations: not configured" in captured.out
+    assert bad_addr not in captured.out
+    assert bad_addr not in captured.err
+
+
 def test_cli_stats_empty_db_no_token(tmp_path: Path, monkeypatch, capsys):
     from hfwb.store import init_db
-    from tests.test_format import assert_no_plan7_forbidden_words
 
     empty_db = tmp_path / "empty_stats.db"
-    init_db(empty_db)  # an existing but empty database; a missing one is an error (see below)
+    init_db(empty_db)
     empty_env = tmp_path / "empty_token.env"
     empty_env.write_text(f"HFWB_DB={empty_db}\n")
 
@@ -165,14 +308,7 @@ def test_cli_stats_empty_db_no_token(tmp_path: Path, monkeypatch, capsys):
     assert "Watches: 0" in captured.out
     assert "Depeg alerts: 0" in captured.out
     assert "Custom levels chats: 0" in captured.out
-    assert "Pro interest:" in captured.out
-    assert "total: 0" in captured.out
-    assert "addresses: 0" in captured.out
-    assert "faster: 0" in captured.out
-    assert "levels: 0" in captured.out
-    assert "email: 0" in captured.out
-    assert "discord: 0" in captured.out
-    assert_no_plan7_forbidden_words(captured.out)
+    assert "Pro interest" not in captured.out
 
 
 def test_cli_stats_seeded_db(tmp_path: Path, monkeypatch, capsys):
@@ -184,9 +320,7 @@ def test_cli_stats_seeded_db(tmp_path: Path, monkeypatch, capsys):
         add_watch,
         init_db,
         set_levels,
-        set_pro_interest,
     )
-    from tests.test_format import assert_no_plan7_forbidden_words
 
     db_path = tmp_path / "seeded_stats.db"
     init_db(db_path)
@@ -203,8 +337,6 @@ def test_cli_stats_seeded_db(tmp_path: Path, monkeypatch, capsys):
     add_watch(db_path, chat2, addr1, "m1")
     add_depeg_subs(db_path, chat1, ["USDC", "USDT"])
     set_levels(db_path, chat1, (Decimal("1.6"), Decimal("1.2")))
-    set_pro_interest(db_path, chat1, ["addresses", "faster"], 1000.0)
-    set_pro_interest(db_path, chat2, [], 1000.0)
 
     empty_env = tmp_path / "empty_token.env"
     empty_env.write_text(f"HFWB_DB={db_path}\n")
@@ -220,13 +352,7 @@ def test_cli_stats_seeded_db(tmp_path: Path, monkeypatch, capsys):
     assert "Watches: 3" in captured.out
     assert "Depeg alerts: 2" in captured.out
     assert "Custom levels chats: 1" in captured.out
-    assert "Pro interest:" in captured.out
-    assert "total: 2" in captured.out
-    assert "addresses: 1" in captured.out
-    assert "faster: 1" in captured.out
-    assert "levels: 0" in captured.out
-    assert "email: 0" in captured.out
-    assert "discord: 0" in captured.out
+    assert "Pro interest" not in captured.out
 
     # No chat IDs, no addresses in output
     assert str(chat1) not in captured.out
@@ -234,9 +360,6 @@ def test_cli_stats_seeded_db(tmp_path: Path, monkeypatch, capsys):
     assert addr1 not in captured.out
     assert addr2 not in captured.out
     assert "0x" not in captured.out
-
-    assert_no_plan7_forbidden_words(captured.out)
-
 
 
 def test_cli_stats_missing_db_fails_and_does_not_create_it(tmp_path: Path, monkeypatch, capsys):
@@ -259,7 +382,6 @@ def test_cli_stats_is_read_only_and_tolerates_an_older_schema(tmp_path: Path, mo
     old_db = tmp_path / "old.db"
     init_db(old_db)
     con = sqlite3.connect(old_db)
-    con.execute("DROP TABLE pro_interest")
     con.execute("PRAGMA user_version = 3")
     con.commit()
     con.close()
@@ -271,9 +393,21 @@ def test_cli_stats_is_read_only_and_tolerates_an_older_schema(tmp_path: Path, mo
 
     assert main(["--stats"]) == 0
     out = capsys.readouterr().out
-    assert "total: 0" in out  # the missing table counts as zero
+    assert "Chats with tracked addresses: 0" in out
 
     con = sqlite3.connect(old_db)
     assert con.execute("PRAGMA user_version").fetchone()[0] == 3  # no migration was run
-    assert con.execute("SELECT name FROM sqlite_master WHERE name='pro_interest'").fetchone() is None
     con.close()
+
+
+def test_donate_address_is_stored_in_checksummed_form(tmp_path: Path, monkeypatch):
+    env = tmp_path / "d.env"
+    env.write_text(
+        "TELEGRAM_BOT_TOKEN=123:abc\nRPC_URL=http://x\n"
+        "DONATE_ADDRESS=0xf903f91565da30b90b57b259fafd3705e667be1a\nDONATE_NOTE=USDC on Base\n"
+    )
+    for k in ("TELEGRAM_BOT_TOKEN", "RPC_URL", "DONATE_ADDRESS", "DONATE_NOTE"):
+        monkeypatch.delenv(k, raising=False)
+    cfg = load_config(env)
+    assert cfg.donate_address == "0xf903f91565dA30B90B57B259fAfd3705E667be1A"
+    assert cfg.donate_note == "USDC on Base"
