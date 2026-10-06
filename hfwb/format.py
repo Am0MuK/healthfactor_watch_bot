@@ -1,5 +1,5 @@
 import html
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
@@ -139,6 +139,7 @@ def format_alert(
     debt_usd: Decimal | None = None,
     market: Any | None = None,
     levels: Sequence[Decimal] = DEFAULT_LEVELS,
+    details: Sequence[str] | None = None,
 ) -> str:
     """Format an alert notification naming the level reached and the market in HTML."""
     emoji = hf_emoji(hf, levels=levels)
@@ -179,7 +180,9 @@ def format_alert(
     if is_critical:
         lines.append("<b>Close to liquidation (1.00)</b>")
 
-    if hf is not None:
+    if details:
+        lines.extend(details)
+    elif hf is not None:
         drop_pct = drop_to_liquidation_pct(hf)
         lines.append(
             f"About <b>{drop_pct:.1f}%</b> of collateral value can fall before liquidation at 1.00 (if debt value stays the same)."
@@ -204,6 +207,7 @@ def format_start() -> str:
         "Commands:\n"
         "/watch &lt;address&gt; - Scan all markets and watch active positions (max 3 addresses per chat)\n"
         "/rescan &lt;address&gt; - Rescan all markets for an address (max once per 5 min)\n"
+        "/whatif &lt;asset&gt; &lt;±%&gt; - Health factor after a market move (e.g. /whatif ETH -20)\n"
         "/levels [levels|reset] - View or set custom alert levels per chat\n"
         "/depeg [on|off] - Configure stablecoin depeg alerts (default off)\n"
         "/donate - Support the bot with a voluntary donation\n"
@@ -237,6 +241,7 @@ def format_scan_response(
     failed_count: int = 0,
     is_rescan: bool = False,
     levels: Sequence[Decimal] = DEFAULT_LEVELS,
+    details: Mapping[str, Sequence[str]] | None = None,
 ) -> str:
     link = profile_link(address)
     action = "Rescan completed" if is_rescan else "Now watching"
@@ -254,6 +259,8 @@ def format_scan_response(
                 lines.append(
                     f"Collateral {format_currency(data.collateral_usd)} · Debt {format_currency(data.debt_usd)}"
                 )
+            if details and hasattr(market, "key") and market.key in details and details[market.key]:
+                lines.extend(details[market.key])
             lines.append("")
         if lines and lines[-1] == "":
             lines.pop()
@@ -387,7 +394,12 @@ def format_list(watches: Sequence[Any], levels: Sequence[Decimal] = DEFAULT_LEVE
                             lines.append(f"- {item[0]}")
                     else:
                         lines.append(f"- {item}")
-        lines.extend(["", lvl_line])
+        lines.extend([
+            "",
+            "Try /whatif ETH -20 to see how a price move changes your health factor.",
+            "",
+            lvl_line,
+        ])
         return "\n".join(lines)
 
     # Legacy flat format: list of (address, state)
@@ -396,7 +408,12 @@ def format_list(watches: Sequence[Any], levels: Sequence[Decimal] = DEFAULT_LEVE
         if isinstance(item, tuple) and len(item) == 2:
             addr, state = item
             lines.append(f"{_state_or_hf_emoji(state)} {profile_link(addr)}")
-    lines.extend(["", lvl_line])
+    lines.extend([
+        "",
+        "Try /whatif ETH -20 to see how a price move changes your health factor.",
+        "",
+        lvl_line,
+    ])
     return "\n".join(lines)
 
 

@@ -18,6 +18,7 @@ A Telegram bot that monitors Aave V3 (20 EVM chains) and Aave V4 (19 spokes acro
 - `/start` - Introduction and usage instructions.
 - `/watch <address>` - Scan all supported markets for an Ethereum address and monitor active positions (max 3 addresses per chat).
 - `/rescan <address>` - Scan all supported markets on demand to detect new positions (rate limit: once per 5 minutes per chat).
+- `/whatif <asset> <±%> [...]` - Health factor of your watched Aave V3 positions after a price move (e.g. `/whatif ETH -20`, `/whatif BTC -10 ETH -15`, `/whatif market -30`).
 - `/levels [levels|reset]` - View or configure custom alert levels for this chat (e.g. `/levels 1.5 1.3 1.15 1.05` or `/levels reset`).
 - `/depeg [on|off [symbols...]]` - View status or configure opt-in stablecoin depeg alerts (e.g. `/depeg on` for all 12 tokens, `/depeg on USDC USDT`, or `/depeg off`).
 - `/donate` - View voluntary donation address and network info.
@@ -79,7 +80,10 @@ All 39 deployments listed in `hfwb/markets.json`:
 🟠 Aave V3 · Base
 Health factor 1.18  ▰▰▱▱▱▱▱▱▱▱
 Fell below 1.2
-About 15.3% of collateral value can fall before liquidation at 1.00 (if debt value stays the same).
+Liquidation if, with other prices unchanged:
+• WETH −25.3% (to $1,867)
+• cbBTC −38.4% (to $36,951)
+All crypto together −15.3%
 Collateral $10,000 · Debt $7,000
 Account: 0x794a…14ad
 
@@ -183,6 +187,15 @@ Alert levels are defined by absolute price deviation from $1.00:
 - **Aave Oracle Price**: When an alert is dispatched, the bot queries the Ethereum Aave Oracle contract (`0x54586bE62E3c3580375aE3723C145253060Ca0C2`) on a best-effort basis for informational context.
 - **Oracle Blind Spots**: The Ethereum Aave Oracle hardcodes GHO to 1.0 USD and proxies USDe to USDT's price feed; alerts for GHO and USDe display `Aave oracle: not independent (fixed or proxy price)` instead of a numeric price.
 - **Yield-bearing Tokens Excluded**: Yield-bearing assets (e.g. sUSDe, sDAI) are not pegged to $1.00 USD and are out of scope.
+
+## Price Moves and `/whatif` (Aave V3)
+
+For Aave V3 positions the bot also reads the position asset by asset: balances, liquidation thresholds (including the eMode category threshold, Aave V3.2+ layout) and Aave's own oracle prices. It reads only the reserves set in the account's `getUserConfiguration` bitmap, so a typical position needs about 8 calls.
+
+- **Tie-out guard.** The bot recomputes collateral, debt and health factor from these numbers and compares them with `getUserAccountData`. If any of the three differs by more than 0.5 %, it shows no per-asset numbers and falls back to the plain alert. Wrong numbers are worse than none.
+- **Liquidation lines** (in `/watch` and in alerts): how far each asset can move on its own before the health factor reaches 1.00, at most 3 assets, smallest move first. A borrowed volatile asset shows a rise (`WETH +40%`). Collateral that covers the debt by itself shows "safe even at $0". "All crypto together" moves every non-stablecoin asset by the same percentage (stablecoins, euro tokens and gold stay fixed); a correlated loop such as wstETH collateral against WETH debt shows "no liquidation". Stablecoins and positions under $1 are left out.
+- **`/whatif`**: up to 5 pairs. `ETH` and `BTC` include their wrapped and staked versions (WETH, wstETH, weETH, rETH, ...; WBTC, cbBTC, tBTC, LBTC, ...); any other symbol matches exactly; `market` moves all crypto. One `/whatif` per chat every 10 seconds.
+- **Limits.** Prices are Aave's oracle prices, not exchange prices. Debt amounts stay fixed (interest keeps accruing in reality). A same-asset loop (WETH supplied and borrowed) cannot be liquidated by the WETH price, only by interest. Aave V4 positions are not covered yet. Every read has a 10-second budget, so a slow RPC cannot hold up alerts.
 
 ## Polling Intervals and Backoff
 
@@ -307,7 +320,7 @@ A `Dockerfile` and `docker-compose.yml` are provided for deployment:
 - Markets marked "best effort" in the table have a single public RPC endpoint.
 - Only Aave V3 and Aave V4 are covered. Other lending protocols are not supported.
 - USD amounts are shown for Aave V3 only. Aave V4 alerts show the health factor.
-- "Distance to liquidation" assumes all collateral prices fall together and the debt value stays the same. It is an estimate.
+- When per-asset data is not available (Aave V4, or the tie-out guard fails), alerts fall back to "About X% of collateral value can fall", which assumes all collateral prices fall together and the debt value stays the same. It is an estimate.
 
 ## License
 

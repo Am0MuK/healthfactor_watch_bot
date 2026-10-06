@@ -1,3 +1,4 @@
+import html
 import re
 import time
 from collections import defaultdict
@@ -33,6 +34,7 @@ from hfwb.format import (
     format_watch_limit,
 )
 from hfwb.markets import Market, get_market, load_markets
+from hfwb.pricedrop import liquidation_lines, parse_whatif, run_whatif
 from hfwb.scan import ScanResult, scan_address
 from hfwb.state import DEFAULT_LEVELS, step, validate_levels
 from hfwb.store import (
@@ -55,6 +57,7 @@ from hfwb.store import (
 RATE_LIMIT_COMMANDS = 10
 RATE_LIMIT_WINDOW = 60.0  # seconds
 RESCAN_RATE_LIMIT_WINDOW = 300.0  # 5 minutes in seconds
+WHATIF_COOLDOWN = 10.0  # seconds
 
 
 class BotHandler:
@@ -70,6 +73,7 @@ class BotHandler:
         scanner_fn: Callable[..., ScanResult] = scan_address,
         donate_address: str | None = None,
         donate_note: str | None = None,
+        positions_reader: Callable[..., Any] | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.rpc_urls = rpc_urls
@@ -79,8 +83,10 @@ class BotHandler:
         self.scanner_fn = scanner_fn
         self.donate_address = donate_address
         self.donate_note = donate_note
+        self.positions_reader = positions_reader
         self._history: dict[int, list[float]] = defaultdict(list)
         self._rescan_history: dict[int, float] = {}
+        self._whatif_history: dict[int, float] = {}
 
     def _is_rate_limited(self, chat_id: int) -> bool:
         now = self.clock()
@@ -271,15 +277,70 @@ class BotHandler:
             if not scan_res.failed:
                 update_last_scan_ts(self.db_path, chat_id, norm_addr, now)
 
+            details: dict[str, list[str]] = {}
+            if self.positions_reader is not None:
+                for market, acct in scan_res.found:
+                    lines = liquidation_lines(
+                        market, norm_addr, acct, positions_reader=self.positions_reader
+                    )
+                    if lines:
+                        details[market.key] = lines
+
             text = format_scan_response(
                 norm_addr,
                 scan_res.found,
                 len(scan_res.failed),
                 is_rescan=is_rescan,
                 levels=chat_levels,
+                details=details if details else None,
             )
             if limit_hit:
                 text += "\n\n" + format_positions_limit()
             return [(chat_id, text)]
+
+        if cmd == "/whatif":
+            raw_args = tokens[1:]
+            try:
+                changes = parse_whatif(raw_args)
+            except ValueError as exc:
+                msg = (
+                    "Usage: /whatif ETH -20 (asset and % change, up to 5 pairs; ETH and BTC include their wrapped and staked versions; 'market' moves all crypto)"
+                    f"\n\nError: {html.escape(str(exc))}"
+                )
+                return [(chat_id, msg)]
+
+            now = self.clock()
+            last_whatif = self._whatif_history.get(chat_id)
+            if last_whatif is not None and (now - last_whatif) < WHATIF_COOLDOWN:
+                return [(chat_id, "Please wait a few seconds between /whatif commands.")]
+            self._whatif_history[chat_id] = now
+
+            if self.positions_reader is None:
+                return [(chat_id, "/whatif is not available right now.")]
+
+            watches = list_watches(self.db_path, chat_id)
+            if not watches:
+                return [
+                    (
+                        chat_id,
+                        "No watched positions found. Use /watch &lt;address&gt; to track a position first.",
+                    )
+                ]
+
+            market_map = {m.key: m for m in self.markets}
+            positions: list[tuple[Market, str]] = []
+            for w in watches:
+                m = market_map.get(w.market_key) or get_market(w.market_key)
+                if m is not None:
+                    positions.append((m, w.address))
+
+            reply = run_whatif(
+                changes=changes,
+                positions=positions,
+                account_reader=self.aave_reader,
+                positions_reader=self.positions_reader,
+                levels=get_levels(self.db_path, chat_id),
+            )
+            return [(chat_id, reply)]
 
         return [(chat_id, format_unknown())]

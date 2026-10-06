@@ -23,6 +23,7 @@ from hfwb.depeg import (
 )
 from hfwb.format import format_alert, format_depeg_alert, format_new_position
 from hfwb.markets import Market, get_market, load_markets
+from hfwb.pricedrop import liquidation_lines
 from hfwb.scan import scan_address
 from hfwb.schedule import INTERVAL_FAR, backoff_for, combine, poll_interval_for
 from hfwb.state import step
@@ -112,6 +113,7 @@ def _poll_core(
     heartbeat_file: str | Path | None = None,
     concurrency_cap: int = DEFAULT_CONCURRENCY_CAP,
     per_host_cap: int = DEFAULT_PER_HOST_CAP,
+    positions_reader: Callable[..., Any] | None = None,
 ) -> None:
     now = clock()
     pairs = distinct_pairs(db_path)
@@ -195,6 +197,8 @@ def _poll_core(
         clear_failure(db_path, m_key, addr)
         watches = list_watches_by_address(db_path, addr, market_key=m_key)
         blocked_chats: set[int] = set()
+        details: list[str] | None = None
+        details_computed = False
         for watch in watches:
             chat_levels = _get_chat_levels(watch.chat_id)
             new_state, alert = step(
@@ -206,6 +210,15 @@ def _poll_core(
             )
 
             if alert is not None:
+                alert_details: list[str] | None = None
+                if alert != "recovery" and positions_reader is not None and market is not None:
+                    if not details_computed:
+                        details = liquidation_lines(
+                            market, addr, outcome, positions_reader=positions_reader
+                        )
+                        details_computed = True
+                    alert_details = details
+
                 alert_text = format_alert(
                     alert_type=alert,
                     address=addr,
@@ -214,6 +227,7 @@ def _poll_core(
                     debt_usd=outcome.debt_usd,
                     market=market,
                     levels=chat_levels,
+                    details=alert_details,
                 )
                 try:
                     tg_client.send_message(watch.chat_id, alert_text)
@@ -272,6 +286,7 @@ def poll_due(
     heartbeat_file: str | Path | None = None,
     concurrency_cap: int = DEFAULT_CONCURRENCY_CAP,
     per_host_cap: int = DEFAULT_PER_HOST_CAP,
+    positions_reader: Callable[..., Any] | None = None,
 ) -> None:
     """Execute adaptive polling cycle across due (market, address) pairs."""
     if scheduler is not None and not isinstance(scheduler, PollScheduler):
@@ -292,6 +307,7 @@ def poll_due(
         heartbeat_file=heartbeat_file,
         concurrency_cap=concurrency_cap,
         per_host_cap=per_host_cap,
+        positions_reader=positions_reader,
     )
 
 
@@ -306,6 +322,7 @@ def poll_once(
     concurrency_cap: int = DEFAULT_CONCURRENCY_CAP,
     per_host_cap: int = DEFAULT_PER_HOST_CAP,
     scheduler: PollScheduler | None = None,
+    positions_reader: Callable[..., Any] | None = None,
 ) -> None:
     """Execute a single polling cycle across all distinct (market, address) pairs."""
     return _poll_core(
@@ -320,6 +337,7 @@ def poll_once(
         heartbeat_file=heartbeat_file,
         concurrency_cap=concurrency_cap,
         per_host_cap=per_host_cap,
+        positions_reader=positions_reader,
     )
 
 
@@ -404,6 +422,7 @@ def run_poll_loop(
     concurrency_cap: int = DEFAULT_CONCURRENCY_CAP,
     per_host_cap: int = DEFAULT_PER_HOST_CAP,
     scheduler: PollScheduler | None = None,
+    positions_reader: Callable[..., Any] | None = None,
 ) -> None:
     """Run recurring poll loop in background ticking every tick_seconds until stop_event is set."""
     effective_tick = poll_interval if poll_interval is not None else tick_seconds
@@ -424,6 +443,7 @@ def run_poll_loop(
                 heartbeat_file=heartbeat_file,
                 concurrency_cap=concurrency_cap,
                 per_host_cap=per_host_cap,
+                positions_reader=positions_reader,
             )
         except Exception:  # top-level guard: a bug must not silently stop alerting
             logger.exception("Unhandled error in poll_due")
@@ -669,6 +689,8 @@ def run_all(
     signal.signal(signal.SIGTERM, _sig_handler)
     signal.signal(signal.SIGINT, _sig_handler)
 
+    from hfwb.positions import read_positions
+
     all_markets = list(markets) if markets is not None else load_markets()
     bot_handler = BotHandler(
         db_path=db_path,
@@ -676,6 +698,7 @@ def run_all(
         rpc_urls=rpc_urls or (),
         donate_address=donate_address,
         donate_note=donate_note,
+        positions_reader=read_positions,
     )
 
     effective_tick = poll_interval if poll_interval is not None else tick_seconds
@@ -690,6 +713,7 @@ def run_all(
             "tg_client": tg_client,
             "heartbeat_file": heartbeat_file,
             "tick_seconds": effective_tick,
+            "positions_reader": read_positions,
         },
         daemon=True,
     )

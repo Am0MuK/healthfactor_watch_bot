@@ -1,5 +1,7 @@
 """Per-asset position reader and tie-out guard for Aave V3 markets."""
 
+import functools
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
@@ -10,6 +12,8 @@ from hfwb.aave import AccountData, ReadError, _keccak_256, normalize_address
 from hfwb.markets import Market
 
 MAX_DECIMALS = 36
+DEFAULT_BUDGET_S = 10.0  # whole read; a hung RPC must not stall the alert or command loop
+CALL_TIMEOUT_S = 5.0
 MAX_RESERVE_ID = 127  # Aave V3 caps reserves at 128 (UserConfigurationMap holds 2 bits each)
 MAX_SYMBOL_LEN = 16
 
@@ -106,6 +110,7 @@ def _eth_call(
     to: str,
     data: str,
     min_hex_len: int = 64,
+    deadline: float | None = None,
 ) -> str:
     """Execute eth_call trying rpcs in sequence. Returns hex string without '0x' prefix."""
     payload = {
@@ -122,6 +127,9 @@ def _eth_call(
     }
     errors: list[str] = []
     for url in rpcs:
+        if deadline is not None and time.monotonic() > deadline:
+            errors.append("time budget exceeded")
+            break
         try:
             resp = client.post(url, json=payload)
             if resp.status_code != 200:
@@ -234,6 +242,7 @@ def read_positions(
     market: Market,
     address: str,
     client: httpx.Client | None = None,
+    budget_s: float = DEFAULT_BUDGET_S,
 ) -> PositionBreakdown:
     """Read per-asset positions and recomputed health factor for an address on Aave V3.
 
@@ -251,11 +260,12 @@ def read_positions(
     encoded_user = _encode_address(normalized_user)
 
     own_client = client is None
-    active_client = client or httpx.Client(timeout=10.0)
+    active_client = client or httpx.Client(timeout=CALL_TIMEOUT_S)
+    call = functools.partial(_eth_call, deadline=time.monotonic() + budget_s)
 
     try:
         # 1. Pool getUserConfiguration(address) -> uint256 bitmap
-        bitmap_hex = _eth_call(
+        bitmap_hex = call(
             active_client,
             market.rpcs,
             market.address,
@@ -265,7 +275,7 @@ def read_positions(
         bitmap = int(bitmap_hex[0:64], 16)
 
         # 2. Pool getUserEMode(address) -> uint256
-        emode_hex = _eth_call(
+        emode_hex = call(
             active_client,
             market.rpcs,
             market.address,
@@ -273,6 +283,8 @@ def read_positions(
             min_hex_len=64,
         )
         emode = int(emode_hex[0:64], 16)
+        if emode > 255:
+            raise ReadError(f"eMode category {emode} is out of uint8 range")
 
         # Parse bitmap for active reserves
         active_reserves: list[tuple[int, bool]] = []
@@ -296,8 +308,32 @@ def read_positions(
                 hf=None,
             )
 
+        # eMode configuration (Aave V3.2+ layout)
+        emode_lt: int = 0
+        emode_bitmap: int = 0
+        if emode != 0:
+            config_hex = call(
+                active_client,
+                market.rpcs,
+                market.address,
+                _selector("getEModeCategoryCollateralConfig(uint8)") + format(emode, "064x"),
+                min_hex_len=192,
+            )
+            emode_lt = int(config_hex[64:128], 16)
+            if emode_lt > 10000:
+                raise ReadError(f"eMode liquidation threshold above 100%: {emode_lt}")
+
+            bitmap_res_hex = call(
+                active_client,
+                market.rpcs,
+                market.address,
+                _selector("getEModeCategoryCollateralBitmap(uint8)") + format(emode, "064x"),
+                min_hex_len=64,
+            )
+            emode_bitmap = int(bitmap_res_hex[0:64], 16)
+
         # 3. Pool ADDRESSES_PROVIDER() -> provider; getPoolDataProvider() and getPriceOracle()
-        provider_hex = _eth_call(
+        provider_hex = call(
             active_client,
             market.rpcs,
             market.address,
@@ -306,7 +342,7 @@ def read_positions(
         )
         provider = normalize_address("0x" + provider_hex[24:64])
 
-        data_provider_hex = _eth_call(
+        data_provider_hex = call(
             active_client,
             market.rpcs,
             provider,
@@ -315,7 +351,7 @@ def read_positions(
         )
         data_provider = normalize_address("0x" + data_provider_hex[24:64])
 
-        oracle_hex = _eth_call(
+        oracle_hex = call(
             active_client,
             market.rpcs,
             provider,
@@ -325,7 +361,7 @@ def read_positions(
         oracle = normalize_address("0x" + oracle_hex[24:64])
 
         # 4. Data provider getAllReservesTokens() -> (string symbol, address)[]
-        reserves_tokens_hex = _eth_call(
+        reserves_tokens_hex = call(
             active_client,
             market.rpcs,
             data_provider,
@@ -338,7 +374,7 @@ def read_positions(
         assets: list[AssetPosition] = []
         for rid, is_collateral in active_reserves:
             # Pool getReserveAddressById(uint16)
-            reserve_addr_hex = _eth_call(
+            reserve_addr_hex = call(
                 active_client,
                 market.rpcs,
                 market.address,
@@ -349,7 +385,7 @@ def read_positions(
             encoded_asset = _encode_address(asset)
 
             # Data provider getUserReserveData(asset, user)
-            user_data_hex = _eth_call(
+            user_data_hex = call(
                 active_client,
                 market.rpcs,
                 data_provider,
@@ -362,7 +398,7 @@ def read_positions(
             debt_raw = stable_debt_raw + variable_debt_raw
 
             # Data provider getReserveConfigurationData(asset)
-            config_data_hex = _eth_call(
+            config_data_hex = call(
                 active_client,
                 market.rpcs,
                 data_provider,
@@ -373,7 +409,7 @@ def read_positions(
             lt_raw = int(config_data_hex[128:192], 16)
 
             # Oracle getAssetPrice(asset)
-            price_hex = _eth_call(
+            price_hex = call(
                 active_client,
                 market.rpcs,
                 oracle,
@@ -393,7 +429,10 @@ def read_positions(
             collateral = Decimal(a_token_raw) / Decimal(10**decimals)
             debt = Decimal(debt_raw) / Decimal(10**decimals)
             price_usd = Decimal(price_raw) / Decimal(10**8)
-            liq_threshold = Decimal(lt_raw) / Decimal(10000)
+            if emode != 0 and ((emode_bitmap >> rid) & 1 == 1):
+                liq_threshold = Decimal(emode_lt) / Decimal(10000)
+            else:
+                liq_threshold = Decimal(lt_raw) / Decimal(10000)
 
             assets.append(
                 AssetPosition(

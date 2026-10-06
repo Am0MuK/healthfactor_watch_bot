@@ -117,6 +117,8 @@ class Chain:
             USDC: (0, 0, 2000 * 10**6, False),  # 2,000 USD debt
         }
         self.emode = 0
+        self.emode_lt: dict[int, int] = {}  # category -> eMode liquidation threshold (bps)
+        self.emode_bitmap: dict[int, int] = {}  # category -> collateral bitmap by reserve id
         self.calls: list[tuple[str, str]] = []
         self.overrides: dict[tuple[str, str], dict] = {}
 
@@ -134,6 +136,11 @@ class Chain:
             return "0x" + word(self.config_bitmap())
         if to == POOL and s == sel("getUserEMode(address)"):
             return "0x" + word(self.emode)
+        if to == POOL and s == sel("getEModeCategoryCollateralConfig(uint8)"):
+            lt = self.emode_lt.get(int(args, 16), 0)
+            return "0x" + word(max(0, lt - 200)) + word(lt) + word(10100 if lt else 0)
+        if to == POOL and s == sel("getEModeCategoryCollateralBitmap(uint8)"):
+            return "0x" + word(self.emode_bitmap.get(int(args, 16), 0))
         if to == POOL and s == sel("ADDRESSES_PROVIDER()"):
             return "0x" + addr_word(PROVIDER)
         if to == POOL and s == sel("getReserveAddressById(uint16)"):
@@ -461,3 +468,83 @@ def test_read_positions_cleans_symbol():
     b = read_positions(V3, USER, client=chain.client())
     sym = next(a.symbol for a in b.assets if a.asset == WETH)
     assert sym == ("WETH" + "X" * 40)[:16]
+
+
+# ---------------------------------------------------------------- eMode (Aave V3.2+ layout)
+
+
+def test_emode_threshold_applies_to_collateral_in_category_bitmap():
+    chain = Chain()
+    chain.emode = 1
+    chain.emode_lt[1] = 9500
+    chain.emode_bitmap[1] = 1 << 0  # WETH (id 0)
+    b = read_positions(V3, USER, client=chain.client())
+    weth = next(a for a in b.assets if a.symbol == "WETH")
+    assert weth.liq_threshold == Decimal("0.95")
+    assert b.weighted_collateral_usd == Decimal(3800)
+    assert b.hf == Decimal("1.9")
+
+
+def test_emode_threshold_not_applied_outside_bitmap():
+    chain = Chain()
+    chain.emode = 1
+    chain.emode_lt[1] = 9500
+    chain.emode_bitmap[1] = 1 << 2  # only WBTC (id 2)
+    b = read_positions(V3, USER, client=chain.client())
+    weth = next(a for a in b.assets if a.symbol == "WETH")
+    assert weth.liq_threshold == Decimal("0.825")
+    assert b.hf == Decimal("1.65")
+
+
+def test_emode_mixed_collateral():
+    chain = Chain()
+    chain.user[WBTC] = (10**7, 0, 0, True)  # 0.1 WBTC = 6,000 USD, base LT 0.78
+    chain.emode = 2
+    chain.emode_lt[2] = 9300
+    chain.emode_bitmap[2] = 1 << 0  # WETH only
+    b = read_positions(V3, USER, client=chain.client())
+    # WETH 4,000 * 0.93 + WBTC 6,000 * 0.78 = 3,720 + 4,680
+    assert b.weighted_collateral_usd == Decimal(8400)
+    assert b.hf == Decimal("4.2")
+
+
+def test_emode_zero_does_not_read_category():
+    chain = Chain()
+    read_positions(V3, USER, client=chain.client())
+    called = {d for _, d in chain.calls}
+    assert sel("getEModeCategoryCollateralConfig(uint8)") not in called
+    assert sel("getEModeCategoryCollateralBitmap(uint8)") not in called
+
+
+def test_emode_category_read_failure_raises():
+    chain = Chain()
+    chain.emode = 1
+    chain.emode_lt[1] = 9500
+    for url in V3.rpcs:
+        chain.overrides[(url, sel("getEModeCategoryCollateralConfig(uint8)"))] = {
+            "jsonrpc": "2.0", "id": 1, "error": {"code": 3, "message": "execution reverted"}
+        }
+    with pytest.raises(ReadError):
+        read_positions(V3, USER, client=chain.client())
+
+
+def test_emode_threshold_above_100_percent_raises():
+    chain = Chain()
+    chain.emode = 1
+    chain.emode_lt[1] = 10001
+    chain.emode_bitmap[1] = 1
+    with pytest.raises(ReadError):
+        read_positions(V3, USER, client=chain.client())
+
+
+def test_emode_category_out_of_range_raises():
+    chain = Chain()
+    chain.emode = 256  # categories are uint8
+    with pytest.raises(ReadError):
+        read_positions(V3, USER, client=chain.client())
+
+
+def test_read_positions_stops_after_time_budget():
+    chain = Chain()
+    with pytest.raises(ReadError, match="time budget"):
+        read_positions(V3, USER, client=chain.client(), budget_s=-1.0)
